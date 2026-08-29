@@ -107,6 +107,44 @@ private val SITE_TWEAKS_JS = """
             document.head.appendChild(st);
             new MutationObserver(killOverlays).observe(document.body, { childList: true });
         }
+        // The site calls getUserMedia with the default echoCancellation: true, which sends
+        // Chromium to the VOICE_COMMUNICATION audio source -- the platform's voice-call
+        // DSP (AEC + noise suppression + AGC), tuned for a handset held at your mouth in a
+        // two-way call. For a lecturer several metres from the phone, the noise
+        // suppression treats the speech as background and the AGC pumps the noise floor
+        // between phrases, which is poor input for transcription. Forcing the three
+        // constraints off moves capture to the plain MIC source instead.
+        //
+        // Confirm from logcat: "Recording active: source=MIC" replaces
+        // source=VOICE_COMMUNICATION. MicDiagnostics then warns that USB routing does not
+        // apply, which is the EXPECTED result here -- see the tradeoff in CLAUDE.md.
+        function forceRawAudioCapture() {
+            if (window.__appRawAudio) return;
+            var md = navigator.mediaDevices;
+            if (!md || !md.getUserMedia) return;
+            window.__appRawAudio = true;
+            var orig = md.getUserMedia.bind(md);
+            md.getUserMedia = function (constraints) {
+                // Copy rather than mutate: the page may reuse its constraints object, and
+                // handing back a modified one is a surprise it never asked for.
+                if (constraints && constraints.audio) {
+                    var audio = (typeof constraints.audio === 'object')
+                        ? Object.assign({}, constraints.audio)
+                        : {};
+                    audio.echoCancellation = false;
+                    audio.noiseSuppression = false;
+                    audio.autoGainControl = false;
+                    constraints = Object.assign({}, constraints);
+                    constraints.audio = audio;
+                    console.log('[app-tweaks] forcing raw audio capture (no AEC/NS/AGC)');
+                }
+                return orig(constraints);
+            };
+            console.log('[app-tweaks] getUserMedia patched');
+        }
+        // Before killOverlays and outside setup(): this one needs no document.body, and it
+        // has to be in place before the user presses record, not merely before load ends.
+        forceRawAudioCapture();
         killOverlays();
         // Arm on DOMContentLoaded rather than relying on a later injection: the WebView's
         // onPageFinished tracks the window 'load' event, which ad/consent scripts can
