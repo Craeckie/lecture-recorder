@@ -114,9 +114,15 @@ private val NET_TRACE_JS = """
             if (!buckets[key]) buckets[key] = { n: 0, err: 0, up: 0, down: 0, ms: [] };
             return buckets[key];
         }
+        // The session id lives in the PATH (e.g. /webapi/123456789012345678901234567890123456789/0/append),
+        // not the query string -- so stripping query strings alone does not keep it out of a
+        // log. Replace any long digit/hex path segment with a placeholder instead.
+        function redactIds(p) {
+            return p.replace(/\/[0-9a-f]{20,}/gi, '/<id>');
+        }
         function pathOf(url) {
-            try { return new URL(url, location.href).pathname; }
-            catch (e) { return String(url); }
+            try { return redactIds(new URL(url, location.href).pathname); }
+            catch (e) { return redactIds(String(url)); }
         }
         // Approximate: string length is characters, not bytes. Good enough to spot an
         // upload that is far bigger or smaller than expected.
@@ -296,9 +302,14 @@ private val PERF_TRACE_JS = """
         var TAG = '[perf]';
         var SUMMARY_MS = 5000;
 
+        // See NET_TRACE_JS's redactIds -- same reasoning: the session id is a long
+        // digit/hex path segment, not a query param, so it needs its own placeholder.
+        function redactIds(p) {
+            return p.replace(/\/[0-9a-f]{20,}/gi, '/<id>');
+        }
         function pathOf(url) {
-            try { return new URL(url, location.href).pathname; }
-            catch (e) { return String(url).split('?')[0]; }
+            try { return redactIds(new URL(url, location.href).pathname); }
+            catch (e) { return redactIds(String(url).split('?')[0]); }
         }
         function stat(a) {
             if (!a.length) return 'n=0';
@@ -834,7 +845,8 @@ private val SITE_TWEAKS_JS = """
                             + Math.round(CAPTURE_BUFFER / CAPTURE_RATE * 1000) + 'ms at '
                             + CAPTURE_RATE + 'Hz)');
                         return csp.call(this, CAPTURE_BUFFER,
-                            arguments[1] || 1, arguments[2] || 1);
+                            arguments.length > 1 ? arguments[1] : 1,
+                            arguments.length > 2 ? arguments[2] : 1);
                     }
                     return csp.apply(this, arguments);
                 };
@@ -858,10 +870,8 @@ private val SITE_TWEAKS_JS = """
         // Short-circuit that case. Everything else is left to the real implementation, so
         // a fallback to a non-16 kHz context still resamples correctly.
         function shortCircuitResampler() {
-            if (window.__appResamplerPatched) return;
             var wr = window.waveResampler;
             if (!wr || typeof wr.resample !== 'function') return;
-            window.__appResamplerPatched = true;
             var orig = wr.resample;
             wr.resample = function (samples, fromRate, toRate) {
                 if (fromRate === toRate) return samples;
@@ -875,10 +885,18 @@ private val SITE_TWEAKS_JS = """
         // patch, before the page's own load-time recording() call -- not merely before
         // load ends.
         patchAudioContext();
-        whenDefined(
-            function () { return !!(window.waveResampler && window.waveResampler.resample); },
-            shortCircuitResampler,
-            'waveResampler');
+        // Guard hoisted out of shortCircuitResampler and up to here: SITE_TWEAKS_JS is
+        // injected four times per page load, and if waveResampler never loads (CDN
+        // unreachable), each injection would otherwise start its own 250ms x 120 polling
+        // interval. Setting the flag before the wait starts -- not only once the patch
+        // lands -- makes every injection after the first a no-op.
+        if (!window.__appResamplerPatched) {
+            window.__appResamplerPatched = true;
+            whenDefined(
+                function () { return !!(window.waveResampler && window.waveResampler.resample); },
+                shortCircuitResampler,
+                'waveResampler');
+        }
         forceRawAudioCapture();
         killOverlays();
         // Arm on DOMContentLoaded rather than relying on a later injection: the WebView's
