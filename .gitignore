@@ -29,3 +29,5 @@ keystore.properties
 # Keystore — never commit credentials
 *.jks
 *.keystore
+
+/.worktrees/
