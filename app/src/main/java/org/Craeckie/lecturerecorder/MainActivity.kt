@@ -150,6 +150,7 @@ private fun isNightMode(context: Context): Boolean =
 
 class MainActivity : ComponentActivity() {
     private lateinit var micRouter: MicRouter
+    private lateinit var micDiagnostics: MicDiagnostics
 
     // Held while the OS permission dialog is up, so the page's own permission request can
     // be answered once the user has decided. Null at all other times.
@@ -171,8 +172,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        // Attached before the WebView exists, so the USB mic is already the communication
-        // device by the time the page can call getUserMedia.
+        // Diagnostics first, so the device inventory is logged before any routing decision.
+        micDiagnostics = MicDiagnostics(this)
+        micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
         // Asked before the page loads, so the OS dialog doesn't land on top of the site's
@@ -206,6 +208,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (hasMicPermission()) {
+            Log.i(LOG_TAG, "Granting page audio capture")
             request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
         } else {
             pendingWebPermission = request
@@ -217,6 +220,7 @@ class MainActivity : ComponentActivity() {
     // off while a lecture is being recorded.
     override fun onDestroy() {
         micRouter.detach()
+        micDiagnostics.detach()
         super.onDestroy()
     }
 }

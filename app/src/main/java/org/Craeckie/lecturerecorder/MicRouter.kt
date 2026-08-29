@@ -80,14 +80,26 @@ class MicRouter(context: Context) {
             if (audioManager.communicationDevice != null) {
                 audioManager.clearCommunicationDevice()
             }
-            Log.i(LOG_TAG, "No USB input among ${devices.size} communication devices; using system default")
+            Log.i(
+                LOG_TAG,
+                "No USB input among ${devices.size} communication devices " +
+                    "(${devices.joinToString { MicDiagnostics.describeDeviceType(it.type) }}); using system default",
+            )
             return
         }
         val device = devices[index]
-        val applied = audioManager.setCommunicationDevice(device)
-        Log.i(
-            LOG_TAG,
-            "USB input selected: ${device.productName} (type=${device.type}), setCommunicationDevice=$applied",
-        )
+        val applied = try {
+            audioManager.setCommunicationDevice(device)
+        } catch (e: IllegalArgumentException) {
+            // The device was listed a moment ago but is gone now — unplugged mid-call.
+            // The AudioDeviceCallback will fire again; nothing to do but say so.
+            Log.w(LOG_TAG, "setCommunicationDevice rejected ${device.productName}", e)
+            false
+        }
+        if (applied) {
+            Log.i(LOG_TAG, "USB input selected: ${MicDiagnostics.describeDeviceType(device.type)} ${device.productName} (id=${device.id})")
+        } else {
+            Log.w(LOG_TAG, "FAILED to select USB input ${device.productName} — capture will use the system default")
+        }
     }
 }
