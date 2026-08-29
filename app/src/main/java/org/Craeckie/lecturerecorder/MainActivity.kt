@@ -719,30 +719,58 @@ private val SITE_TWEAKS_JS = """
             };
             console.log('[app-tweaks] getUserMedia patched');
         }
-        // The page builds its AudioContext from a load-time recording() call -- see
-        // site-reference/present/inline/05-audio-capture-and-upload.js, where
-        // `new AudioContext()` runs BEFORE its own getUserMedia and nothing ever calls
-        // resume(). Under Chromium's autoplay policy a context constructed at that point,
-        // with no user activation and no capture yet in flight, starts SUSPENDED, and a
-        // suspended context never fires onaudioprocess: no audio is encoded, nothing is
-        // uploaded, the transcript stays empty and the page reports no error at all. The
-        // record button still flips to "stop", so the UI looks like it is recording.
+        // The page's own globals appear only once their <script> has run, which is after
+        // our first injection. Poll briefly rather than relying on injection timing.
+        function whenDefined(test, apply, label) {
+            if (test()) { apply(); return; }
+            var tries = 0;
+            var timer = setInterval(function () {
+                if (test()) { apply(); clearInterval(timer); return; }
+                if (++tries > 120) {
+                    clearInterval(timer);
+                    console.log('[app-tweaks] gave up waiting for ' + label);
+                }
+            }, 250);
+        }
+
+        // One wrapper over AudioContext doing two jobs, because both must be decided at
+        // construction time and there is only one constructor to hook.
         //
-        // Reproduced against the vendored snapshot by tools/perf-trace-selftest.mjs,
-        // which logs "AudioContext created: state=suspended" for the page's own context
-        // while a context created later on the same page comes up running.
+        // 1. RESUME. The page builds its AudioContext from a load-time recording() call --
+        //    see site-reference/present/inline/05-audio-capture-and-upload.js, where
+        //    `new AudioContext()` runs BEFORE its own getUserMedia and nothing ever calls
+        //    resume(). Under Chromium's autoplay policy a context constructed at that
+        //    point starts SUSPENDED, and a suspended context never fires onaudioprocess:
+        //    no audio encoded, nothing uploaded, empty transcript, no error. The record
+        //    button still flips to "stop", so the UI looks like it is recording.
         //
-        // settings.mediaPlaybackRequiresUserGesture = false relaxes the same policy for
-        // this WebView; this patch is the belt to that braces, and is also what would
-        // cover a context that gets suspended again later (the platform suspends audio
-        // on some interruptions). Retrying on user input costs nothing when the flag has
-        // already done the job.
-        function autoResumeAudioContext() {
-            if (window.__appAudioResume) return;
+        // 2. RATE. The page captures at the hardware rate and then resamples 48k -> 16k on
+        //    the MAIN THREAD, inside the ScriptProcessorNode callback, costing 31ms of a
+        //    341ms budget (wave-resampler defaults to cubic PLUS a 16th-order IIR
+        //    low-pass, forward and backward over the buffer). Asking for a 16 kHz context
+        //    makes Chromium resample natively, in the audio pipeline, off the main thread.
+        //
+        // ONLY the first context is retuned. AudioQueuePlayer constructs one AudioContext
+        // per TTS player for PLAYBACK; forcing 16 kHz on those would degrade TTS output.
+        // The capture context is the first the page constructs, which
+        // tools/site-patches-test.mjs asserts.
+        function patchAudioContext() {
+            if (window.__appAudioPatched) return;
             var Native = window.AudioContext || window.webkitAudioContext;
             if (!Native) return;
-            window.__appAudioResume = true;
+            window.__appAudioPatched = true;
+            window.__appAllCtxRates = [];
+            var CAPTURE_RATE = 16000;
+            // 4096 frames at 16 kHz = 256ms per callback, slightly tighter than the 341ms
+            // the page gets today from 16384 frames at 48 kHz. Leaving the page's hardcoded
+            // 16384 in place would make it 1024ms and triple capture latency.
+            //
+            // This does not affect upload throughput: the sender drains everything
+            // accumulated on each send, so a slower link produces larger payloads rather
+            // than more requests. Buffer size sets granularity and latency only.
+            var CAPTURE_BUFFER = 4096;
             var live = [];
+
             function kick(ctx, why) {
                 if (!ctx || ctx.state !== 'suspended') return;
                 var p = ctx.resume();
@@ -754,10 +782,35 @@ private val SITE_TWEAKS_JS = """
                     });
                 }
             }
-            var Wrapped = function () {
-                var ctx = new Native(arguments[0]);
+
+            var Wrapped = function (options) {
+                var isFirst = (window.__appAllCtxRates.length === 0);
+                var opts = options;
+                if (isFirst) {
+                    opts = {};
+                    if (options) {
+                        for (var k in options) {
+                            if (Object.prototype.hasOwnProperty.call(options, k)) opts[k] = options[k];
+                        }
+                    }
+                    opts.sampleRate = CAPTURE_RATE;
+                }
+                var ctx;
+                try {
+                    ctx = new Native(opts);
+                } catch (e) {
+                    // A device that cannot render at 16 kHz: fall back rather than lose
+                    // capture entirely. The page's own resampler then does its usual work.
+                    console.log('[app-tweaks] 16 kHz AudioContext refused (' + e
+                        + '), falling back to the default rate');
+                    ctx = new Native(options);
+                }
+                window.__appAllCtxRates.push(ctx.sampleRate);
+                if (isFirst) window.__appCaptureCtx = ctx;
                 live.push(ctx);
-                console.log('[app-tweaks] AudioContext created, state=' + ctx.state);
+                console.log('[app-tweaks] AudioContext ' + window.__appAllCtxRates.length
+                    + ' created, state=' + ctx.state + ' rate=' + ctx.sampleRate
+                    + (isFirst ? ' (capture)' : ' (playback)'));
                 kick(ctx, 'on create');
                 ctx.addEventListener('statechange', function () {
                     console.log('[app-tweaks] AudioContext state -> ' + ctx.state);
@@ -769,21 +822,63 @@ private val SITE_TWEAKS_JS = """
             window.AudioContext = Wrapped;
             if (window.webkitAudioContext) window.webkitAudioContext = Wrapped;
 
-            // Last resort: the first real user interaction always carries activation, so
-            // even a policy we cannot relax from the shell gets satisfied by one tap.
+            // The page hardcodes 16384 frames, sized for 48 kHz. Re-size only on the
+            // capture context, and only when it actually came up at 16 kHz.
+            try {
+                var csp = Native.prototype.createScriptProcessor;
+                Native.prototype.createScriptProcessor = function (bufferSize) {
+                    if (this === window.__appCaptureCtx && this.sampleRate === CAPTURE_RATE
+                        && bufferSize > CAPTURE_BUFFER) {
+                        console.log('[app-tweaks] ScriptProcessor buffer ' + bufferSize
+                            + ' -> ' + CAPTURE_BUFFER + ' ('
+                            + Math.round(CAPTURE_BUFFER / CAPTURE_RATE * 1000) + 'ms at '
+                            + CAPTURE_RATE + 'Hz)');
+                        return csp.call(this, CAPTURE_BUFFER,
+                            arguments[1] || 1, arguments[2] || 1);
+                    }
+                    return csp.apply(this, arguments);
+                };
+            } catch (e) {
+                console.log('[app-tweaks] cannot re-size ScriptProcessor buffer: ' + e);
+            }
+
+            // Last resort for the resume half: the first real user interaction always
+            // carries activation, so even a policy we cannot relax from the shell gets
+            // satisfied by one tap.
             ['pointerdown', 'touchend', 'keydown'].forEach(function (evt) {
                 document.addEventListener(evt, function () {
                     live.forEach(function (c) { kick(c, evt); });
                 }, { capture: true, passive: true });
             });
-            console.log('[app-tweaks] AudioContext auto-resume armed');
+            console.log('[app-tweaks] AudioContext patched (resume + ' + CAPTURE_RATE + 'Hz capture)');
+        }
+
+        // wave-resampler runs its IIR low-pass even when the input and output rates are
+        // equal, so a 16 kHz capture context alone does not make the page's call free.
+        // Short-circuit that case. Everything else is left to the real implementation, so
+        // a fallback to a non-16 kHz context still resamples correctly.
+        function shortCircuitResampler() {
+            if (window.__appResamplerPatched) return;
+            var wr = window.waveResampler;
+            if (!wr || typeof wr.resample !== 'function') return;
+            window.__appResamplerPatched = true;
+            var orig = wr.resample;
+            wr.resample = function (samples, fromRate, toRate) {
+                if (fromRate === toRate) return samples;
+                return orig.apply(this, arguments);
+            };
+            console.log('[app-tweaks] waveResampler.resample short-circuited for equal rates');
         }
 
         // Before killOverlays and outside setup(): these need no document.body, and they
         // have to be in place before the user presses record -- and, for the AudioContext
         // patch, before the page's own load-time recording() call -- not merely before
         // load ends.
-        autoResumeAudioContext();
+        patchAudioContext();
+        whenDefined(
+            function () { return !!(window.waveResampler && window.waveResampler.resample); },
+            shortCircuitResampler,
+            'waveResampler');
         forceRawAudioCapture();
         killOverlays();
         // Arm on DOMContentLoaded rather than relying on a later injection: the WebView's
