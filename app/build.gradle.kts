@@ -34,6 +34,10 @@ android {
     kotlinOptions { jvmTarget = "11" }
 
     buildFeatures { compose = true }
+
+    // Unit tests touch only MicRouting's pure logic, but this keeps any stray android.jar
+    // call returning a default instead of throwing "not mocked".
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 dependencies {
