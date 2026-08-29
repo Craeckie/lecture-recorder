@@ -45,8 +45,8 @@ private const val SITE_URL = "https://lt2srv.iar.kit.edu/"
 // Logcat tag for the forwarded page console (adb logcat -s LectureRecorder).
 internal const val LOG_TAG = "LectureRecorder"
 
-// Dark theme via the real Dark Reader engine (bundled MIT-licensed library, see
-// app/src/main/assets/darkreader.js + darkreader-LICENSE.txt), not a CSS filter hack.
+// Dark theme via the real Dark Reader engine (bundled as
+// app/src/main/assets/darkreader.js), not a CSS filter hack.
 // Dark Reader's Dynamic Theme analyzes each element's actual colors and computes a
 // matching dark replacement per element, which is why saturated content comes out looking
 // natural instead of hue-shifted the way a blanket filter:invert()+hue-rotate(180deg) does.
