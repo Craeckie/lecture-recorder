@@ -10,8 +10,6 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresApi
 
-private const val LOG_TAG = "LectureRecorder"
-
 // The pure selection rule, kept free of Android types so it can be unit-tested on the JVM.
 object MicRouting {
     val USB_INPUT_TYPES: Set<Int> = setOf(

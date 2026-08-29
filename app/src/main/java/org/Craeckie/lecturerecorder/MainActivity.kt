@@ -37,7 +37,7 @@ import org.Craeckie.lecturerecorder.ui.theme.AppTheme
 private const val SITE_URL = "https://lt2srv.iar.kit.edu/"
 
 // Logcat tag for the forwarded page console (adb logcat -s LectureRecorder).
-private const val LOG_TAG = "LectureRecorder"
+internal const val LOG_TAG = "LectureRecorder"
 
 // Dark theme via the real Dark Reader engine (bundled MIT-licensed library, see
 // app/src/main/assets/darkreader.js + darkreader-LICENSE.txt), not a CSS filter hack.
