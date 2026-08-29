@@ -12,6 +12,7 @@ import android.graphics.Color
 import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.ConsoleMessage
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
@@ -173,7 +174,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Diagnostics first, so the device inventory is logged before any routing decision.
-        micDiagnostics = MicDiagnostics(this)
+        micDiagnostics = MicDiagnostics(this, ::setKeepScreenOn)
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
@@ -191,6 +192,19 @@ class MainActivity : ComponentActivity() {
                     )
                 }
             }
+        }
+    }
+
+    // A screen that sleeps mid-lecture kills the recording twice over, and silently: the
+    // site auto-mutes on visibilitychange, and Android silences the mic for a backgrounded
+    // app that has no microphone-type foreground service (see CLAUDE.md). Held only while
+    // capture is actually live, so ordinary browsing still lets the screen time out.
+    private fun setKeepScreenOn(keepOn: Boolean) {
+        Log.i(LOG_TAG, "FLAG_KEEP_SCREEN_ON ${if (keepOn) "set" else "cleared"}")
+        if (keepOn) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 

@@ -31,3 +31,6 @@ keystore.properties
 *.keystore
 
 /.worktrees/
+
+# Playwright MCP scratch output
+.playwright-mcp/

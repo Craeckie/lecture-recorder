@@ -13,12 +13,20 @@ import java.util.concurrent.Executor
 
 // Everything this app logs about the microphone. Kept apart from MicRouter so the routing
 // decision stays readable: MicRouter decides, MicDiagnostics reports.
-class MicDiagnostics(context: Context) {
+class MicDiagnostics(
+    context: Context,
+    // Called on the main thread whenever capture starts or stops, and only on an actual
+    // transition. The recording callback is the one signal the shell has for "the page is
+    // capturing right now" — the page itself never tells us — so this is also what drives
+    // FLAG_KEEP_SCREEN_ON in MainActivity.
+    private val onCaptureActiveChanged: (Boolean) -> Unit = {},
+) {
     private val audioManager =
         context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val mainExecutor = Executor { command -> Handler(Looper.getMainLooper()).post(command) }
     private var recordingCallback: AudioManager.AudioRecordingCallback? = null
     private var communicationDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
+    private var captureActive = false
 
     companion object {
         // AudioDeviceInfo.TYPE_* names, for the types this app can plausibly see. Unmapped
@@ -83,6 +91,12 @@ class MicDiagnostics(context: Context) {
     fun detach() {
         recordingCallback?.let { audioManager.unregisterAudioRecordingCallback(it) }
         recordingCallback = null
+        // No more callbacks are coming, so report the capture as over rather than leaving
+        // the listener believing it is still running.
+        if (captureActive) {
+            captureActive = false
+            onCaptureActiveChanged(false)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             communicationDeviceListener?.let { audioManager.removeOnCommunicationDeviceChangedListener(it) }
         }
@@ -104,6 +118,11 @@ class MicDiagnostics(context: Context) {
     }
 
     private fun logRecordingConfigs(configs: List<AudioRecordingConfiguration>) {
+        val active = configs.isNotEmpty()
+        if (active != captureActive) {
+            captureActive = active
+            onCaptureActiveChanged(active)
+        }
         if (configs.isEmpty()) {
             // Also the normal end of a recording — read it together with the page console.
             Log.i(LOG_TAG, "Recording stopped (no active capture)")
