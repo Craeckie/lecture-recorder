@@ -1,9 +1,11 @@
 package org.Craeckie.lecturerecorder
 
 import android.annotation.SuppressLint
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -11,6 +13,7 @@ import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -20,6 +23,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
@@ -144,9 +149,31 @@ private fun isNightMode(context: Context): Boolean =
         Configuration.UI_MODE_NIGHT_YES
 
 class MainActivity : ComponentActivity() {
+    // Held while the OS permission dialog is up, so the page's own permission request can
+    // be answered once the user has decided. Null at all other times.
+    private var pendingWebPermission: PermissionRequest? = null
+
+    private val micPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            Log.i(LOG_TAG, "RECORD_AUDIO granted=$granted")
+            val pending = pendingWebPermission
+            pendingWebPermission = null
+            if (pending == null) return@registerForActivityResult
+            if (granted) {
+                pending.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+            } else {
+                pending.deny()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Asked before the page loads, so the OS dialog doesn't land on top of the site's
+        // own recording UI mid-lecture.
+        if (!hasMicPermission()) {
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
         setContent {
             AppTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
@@ -155,6 +182,10 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 }
 
 @SuppressLint("SetJavaScriptEnabled")

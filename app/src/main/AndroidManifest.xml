@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The one permission a WebView wrapper needs: load the wrapped site. -->
+    <!-- Load the wrapped site. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- The wrapped site records audio for transcription; MODIFY_AUDIO_SETTINGS is what
+         lets the shell pick the USB mic as the communication device (see MicRouter). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <application
         android:name=".LectureRecorderApplication"
