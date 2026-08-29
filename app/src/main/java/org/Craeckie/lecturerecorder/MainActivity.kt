@@ -149,6 +149,8 @@ private fun isNightMode(context: Context): Boolean =
         Configuration.UI_MODE_NIGHT_YES
 
 class MainActivity : ComponentActivity() {
+    private lateinit var micRouter: MicRouter
+
     // Held while the OS permission dialog is up, so the page's own permission request can
     // be answered once the user has decided. Null at all other times.
     private var pendingWebPermission: PermissionRequest? = null
@@ -169,6 +171,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Attached before the WebView exists, so the USB mic is already the communication
+        // device by the time the page can call getUserMedia.
+        micRouter = MicRouter(this)
+        micRouter.attach()
         // Asked before the page loads, so the OS dialog doesn't land on top of the site's
         // own recording UI mid-lecture.
         if (!hasMicPermission()) {
@@ -177,7 +183,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             AppTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    SiteWebView(modifier = Modifier.padding(innerPadding))
+                    SiteWebView(
+                        modifier = Modifier.padding(innerPadding),
+                        onAudioPermissionRequest = ::handleWebAudioPermission,
+                    )
                 }
             }
         }
@@ -186,11 +195,38 @@ class MainActivity : ComponentActivity() {
     private fun hasMicPermission(): Boolean =
         ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
+
+    // The page's getUserMedia lands here. Grant audio capture only — and only when the OS
+    // permission is actually held, since granting a WebView resource the app doesn't own
+    // just makes the capture fail later with a less obvious error.
+    private fun handleWebAudioPermission(request: PermissionRequest) {
+        if (!request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) {
+            Log.i(LOG_TAG, "Denying page permission request for ${request.resources.joinToString()}")
+            request.deny()
+            return
+        }
+        if (hasMicPermission()) {
+            request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
+        } else {
+            pendingWebPermission = request
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    // Deliberately onDestroy and not onPause: the routing has to survive the screen going
+    // off while a lecture is being recorded.
+    override fun onDestroy() {
+        micRouter.detach()
+        super.onDestroy()
+    }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun SiteWebView(modifier: Modifier = Modifier) {
+fun SiteWebView(
+    modifier: Modifier = Modifier,
+    onAudioPermissionRequest: (PermissionRequest) -> Unit,
+) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
     // into a State explicitly (updated on every navigation) for BackHandler to react
@@ -235,6 +271,12 @@ fun SiteWebView(modifier: Modifier = Modifier) {
                     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
                         Log.d(LOG_TAG, "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
                         return true
+                    }
+
+                    // Without this override WebView denies every getUserMedia call, so the
+                    // site's recorder silently never starts.
+                    override fun onPermissionRequest(request: PermissionRequest) {
+                        onAudioPermissionRequest(request)
                     }
                 }
                 val isDark = isNightMode(context)
