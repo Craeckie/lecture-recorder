@@ -49,6 +49,11 @@ class MicDiagnostics(context: Context) {
         fun describeDeviceType(type: Int): String = DEVICE_TYPE_NAMES[type] ?: "TYPE_$type"
 
         fun describeAudioSource(source: Int): String = AUDIO_SOURCE_NAMES[source] ?: "SOURCE_$source"
+
+        // Shared device-description format, so MicRouter's routing-decision logs and
+        // MicDiagnostics's own logs describe the same device in the same shape.
+        internal fun describe(device: AudioDeviceInfo): String =
+            "${device.productName} [${describeDeviceType(device.type)} id=${device.id}]"
     }
 
     fun attach() {
@@ -63,8 +68,11 @@ class MicDiagnostics(context: Context) {
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val listener = AudioManager.OnCommunicationDeviceChangedListener { device ->
-                // Fires when something else takes the communication device away from us —
-                // a phone call, a Bluetooth headset connecting, another app's routing.
+                // Fires both as an echo of this app's own setCommunicationDevice() calls and
+                // for external changes (a call, another app, a Bluetooth headset connecting).
+                // On the normal happy path you'll see "USB communication device selected: ..."
+                // immediately followed by this line for the same device — that's the echo,
+                // not a takeover; don't mistake it for interference.
                 Log.i(LOG_TAG, "Communication device now: ${device?.let(::describe) ?: "none"}")
             }
             audioManager.addOnCommunicationDeviceChangedListener(mainExecutor, listener)
@@ -129,7 +137,4 @@ class MicDiagnostics(context: Context) {
             }
         }
     }
-
-    private fun describe(device: AudioDeviceInfo): String =
-        "${device.productName} [${describeDeviceType(device.type)} id=${device.id}]"
 }

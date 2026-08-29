@@ -10,19 +10,32 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresApi
 
-// The pure selection rule, kept free of Android types so it can be unit-tested on the JVM.
+// The pure selection rule. Free of any Android runtime behavior — it only references
+// compile-time int constants from AudioDeviceInfo, which is why it can be unit-tested on a
+// bare JVM.
+//
+// These type constants describe devices from AudioManager.availableCommunicationDevices,
+// which is a SINK-role (playback) device list, not literally a list of microphones — the
+// platform maps a selected sink to its matching source automatically. That means a USB
+// headset or audio interface (which has a playback path) can appear here and route
+// correctly, but a plain input-only USB microphone with no playback endpoint (a lav mic, a
+// podcast mic — exactly the hardware this app is named for) can NEVER appear in this list.
+// There is no workaround for that case: it is the same category of limitation as
+// AudioRecord.setPreferredDevice being unreachable from this shell — see the spec's "Known
+// limitation" section.
 object MicRouting {
-    val USB_INPUT_TYPES: Set<Int> = setOf(
+    val USB_COMMUNICATION_TYPES: Set<Int> = setOf(
         AudioDeviceInfo.TYPE_USB_DEVICE,
         AudioDeviceInfo.TYPE_USB_ACCESSORY,
         AudioDeviceInfo.TYPE_USB_HEADSET,
     )
 
-    // Index of the first USB input in the given device-type list, or null if there is none.
-    // First-wins rather than a priority order: the platform lists devices in connection
-    // order, and with two USB mics attached there is no principled way to prefer one.
-    fun pickPreferredInputIndex(deviceTypes: List<Int>): Int? =
-        deviceTypes.indexOfFirst { it in USB_INPUT_TYPES }.takeIf { it >= 0 }
+    // Index of the first USB communication device in the given device-type list, or null if
+    // there is none. First-wins rather than a priority order: the platform lists devices in
+    // connection order, and with two USB mics attached there is no principled way to prefer
+    // one.
+    fun pickPreferredDeviceIndex(deviceTypes: List<Int>): Int? =
+        deviceTypes.indexOfFirst { it in USB_COMMUNICATION_TYPES }.takeIf { it >= 0 }
 }
 
 // Routes microphone capture to an attached USB input, so the wrapped page's getUserMedia
@@ -46,15 +59,7 @@ class MicRouter(context: Context) {
             return
         }
         if (deviceCallback != null) return
-        val callback = object : AudioDeviceCallback() {
-            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-                applyRouting()
-            }
-
-            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-                applyRouting()
-            }
-        }
+        val callback = newDeviceCallback()
         audioManager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
         deviceCallback = callback
         applyRouting()
@@ -69,20 +74,34 @@ class MicRouter(context: Context) {
         }
     }
 
+    // Only ever constructed from inside the SDK_INT >= S branch of attach(), but its
+    // overrides call applyRouting() (itself @RequiresApi(S)), which static analysis can't
+    // see across that branch — so the helper that builds it is annotated directly.
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun newDeviceCallback(): AudioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            applyRouting()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            applyRouting()
+        }
+    }
+
     // Selects the USB input among the devices the platform reports as usable for
     // communication capture. availableCommunicationDevices — not getDevices() — because
     // setCommunicationDevice only accepts devices from that list.
     @RequiresApi(Build.VERSION_CODES.S)
     private fun applyRouting() {
         val devices = audioManager.availableCommunicationDevices
-        val index = MicRouting.pickPreferredInputIndex(devices.map { it.type })
+        val index = MicRouting.pickPreferredDeviceIndex(devices.map { it.type })
         if (index == null) {
             if (audioManager.communicationDevice != null) {
                 audioManager.clearCommunicationDevice()
             }
             Log.i(
                 LOG_TAG,
-                "No USB input among ${devices.size} communication devices " +
+                "No USB communication device among ${devices.size} communication devices " +
                     "(${devices.joinToString { MicDiagnostics.describeDeviceType(it.type) }}); using system default",
             )
             return
@@ -97,9 +116,9 @@ class MicRouter(context: Context) {
             false
         }
         if (applied) {
-            Log.i(LOG_TAG, "USB input selected: ${MicDiagnostics.describeDeviceType(device.type)} ${device.productName} (id=${device.id})")
+            Log.i(LOG_TAG, "USB communication device selected: ${MicDiagnostics.describe(device)}")
         } else {
-            Log.w(LOG_TAG, "FAILED to select USB input ${device.productName} — capture will use the system default")
+            Log.w(LOG_TAG, "FAILED to select USB communication device ${device.productName} — capture will use the system default")
         }
     }
 }

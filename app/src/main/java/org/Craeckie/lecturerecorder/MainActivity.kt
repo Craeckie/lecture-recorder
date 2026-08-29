@@ -211,6 +211,13 @@ class MainActivity : ComponentActivity() {
             Log.i(LOG_TAG, "Granting page audio capture")
             request.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
         } else {
+            // A second request while the OS dialog for the first is still up would
+            // otherwise silently orphan the first PermissionRequest — never granted or
+            // denied, leaving the page's getUserMedia promise hanging forever.
+            pendingWebPermission?.let {
+                Log.i(LOG_TAG, "Displaced pending audio permission request by a newer one; denying it")
+                it.deny()
+            }
             pendingWebPermission = request
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
