@@ -212,6 +212,425 @@ private val NET_TRACE_JS = """
         console.log(TAG + ' tracing armed');
     })();
 """.trimIndent()
+// Audio-pipeline and main-thread tracing for debug builds.
+//
+// NET_TRACE_JS answers "is anything going over the wire". This answers the question that
+// comes first: does the page's capture pipeline ever produce anything to send? The page
+// reports nothing when that pipeline breaks -- no error, no banner, just an empty
+// transcript -- so every stage has to be observed from outside.
+//
+// The pipeline, in order (site-reference/present/inline/05-audio-capture-and-upload.js):
+//
+//   getUserMedia -> AudioContext -> ScriptProcessorNode.onaudioprocess
+//     -> waveResampler.resample(48k -> 16k)      <- loaded from cdn.jsdelivr.net
+//     -> new AudioData(...) -> AudioEncoder.encode()   <- WebCodecs Opus
+//     -> opusPackets[] -> POST /append
+//
+// Each stage below has its own counter, because each fails differently and silently:
+//
+//   ctx=        AudioContext state. 'suspended' means the autoplay/gesture policy never
+//               let it start -- the site calls recording() at load, with no user gesture
+//               anywhere in the stack, and never calls resume(). Nothing downstream runs.
+//   cb=         ScriptProcessorNode callbacks. 0 while ctx=running means the node was
+//               never wired up; a gap far above 'expect' means the main thread starved it.
+//   cbErr=      exceptions thrown inside the site's own callback. The site does not catch
+//               them, so one per callback silences capture completely while leaving the
+//               UI looking healthy. The likely thrower is waveResampler being undefined:
+//               it is a render-blocking script from a third-party CDN, so a browser that
+//               cannot reach cdn.jsdelivr.net loses capture entirely while a browser with
+//               it cached keeps working. resampler= reports whether it is present.
+//   enc=        AudioEncoder.encode() calls vs. packets its output callback produced.
+//               encode>0 with pkt=0 means WebCodecs accepted the audio and emitted
+//               nothing -- the encoder is the failing stage.
+//   path=       which field the page actually POSTs: b64_enc_opus, or the
+//               b64_enc_pcm_s16le fallback. The fallback is ~340 kbit/s on the wire
+//               against Opus's ~43, which on this link is the difference between
+//               keeping up and never catching up.
+//
+// Then the second-order problem, which only shows up in a long session:
+//
+//   longtasks=  main-thread time in tasks over 50ms
+//   addMessage= per-call cost of the site's transcript renderer, and dom= the transcript
+//               size it is proportional to. Rendering cost grows linearly with transcript
+//               length, so total work is quadratic and a session degrades as it runs.
+//
+// Metadata only -- counts, durations, sizes, states. Never headers, never bodies, and
+// paths are taken without query strings, so no session token can reach a log you send on.
+private val PERF_TRACE_JS = """
+    (function () {
+        if (window.__appPerfTrace) return;
+        window.__appPerfTrace = true;
+        var TAG = '[perf]';
+        var SUMMARY_MS = 5000;
+
+        function pathOf(url) {
+            try { return new URL(url, location.href).pathname; }
+            catch (e) { return String(url).split('?')[0]; }
+        }
+        function stat(a) {
+            if (!a.length) return 'n=0';
+            var s = a.slice().sort(function (x, y) { return x - y; });
+            return 'p50=' + Math.round(s[Math.floor(s.length * 0.5)]) + 'ms'
+                 + ' max=' + Math.round(s[s.length - 1]) + 'ms';
+        }
+        function once(key, msg) {
+            if (window['__perfSeen_' + key]) return;
+            window['__perfSeen_' + key] = true;
+            console.log(TAG + ' ' + msg);
+        }
+
+        // ---- stage 1: getUserMedia --------------------------------------------------
+        // Reports what the browser actually applied, which is not what the site asked for:
+        // the site puts echoCancellation at the top level of the constraints object where
+        // the spec ignores it (see CLAUDE.md, "Raw capture vs. USB routing").
+        try {
+            var gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+            navigator.mediaDevices.getUserMedia = function (constraints) {
+                var t0 = performance.now();
+                return gum(constraints).then(function (stream) {
+                    var track = stream.getAudioTracks()[0];
+                    var s = {};
+                    try { s = track.getSettings(); } catch (e) {}
+                    console.log(TAG + ' getUserMedia ok after ' + Math.round(performance.now() - t0)
+                        + 'ms: ' + (s.sampleRate || '?') + 'Hz ch=' + (s.channelCount || '?')
+                        + ' ec=' + s.echoCancellation + ' ns=' + s.noiseSuppression
+                        + ' agc=' + s.autoGainControl);
+                    return stream;
+                }, function (err) {
+                    console.log(TAG + ' getUserMedia FAILED after '
+                        + Math.round(performance.now() - t0) + 'ms: ' + err);
+                    throw err;
+                });
+            };
+        } catch (e) {
+            console.log(TAG + ' cannot wrap getUserMedia: ' + e);
+        }
+
+        // ---- stage 2: AudioContext --------------------------------------------------
+        // The single most likely reason for a completely empty transcript. The site
+        // constructs its AudioContext from a load-time recording() call with no user
+        // gesture, and never calls resume(), so a browser that enforces a gesture
+        // requirement leaves it suspended forever and no callback ever fires.
+        var ctxRef = null;
+        try {
+            var NativeCtx = window.AudioContext || window.webkitAudioContext;
+            if (NativeCtx) {
+                var Wrapped = function () {
+                    var c = new NativeCtx(arguments[0]);
+                    ctxRef = c;
+                    console.log(TAG + ' AudioContext created: state=' + c.state
+                        + ' sampleRate=' + c.sampleRate);
+                    if (c.state !== 'running') {
+                        console.log(TAG + ' AudioContext is NOT running -- capture is dead'
+                            + ' until something resumes it. The page never calls resume().');
+                    }
+                    c.addEventListener('statechange', function () {
+                        console.log(TAG + ' AudioContext state -> ' + c.state);
+                    });
+                    return c;
+                };
+                Wrapped.prototype = NativeCtx.prototype;
+                window.AudioContext = Wrapped;
+                if (window.webkitAudioContext) window.webkitAudioContext = Wrapped;
+            }
+        } catch (e) {
+            console.log(TAG + ' cannot wrap AudioContext: ' + e);
+        }
+
+        // ---- stage 3: the resampler, and the callback that uses it -------------------
+        // Wrapped through the prototype's own accessor so the native dispatch path is
+        // unchanged; we only time and guard the site's handler. Injected from
+        // onPageStarted so this lands before the page builds its graph.
+        var cbDur = [], cbGap = [], cbErrs = 0, firstCbErr = null;
+        var cbExpectMs = 0;
+        try {
+            var csp = (window.AudioContext && AudioContext.prototype.createScriptProcessor)
+                ? AudioContext.prototype.createScriptProcessor : null;
+            if (csp) {
+                AudioContext.prototype.createScriptProcessor = function (bufferSize) {
+                    var node = csp.apply(this, arguments);
+                    cbExpectMs = bufferSize / this.sampleRate * 1000;
+                    console.log(TAG + ' ScriptProcessor ' + bufferSize + ' frames @'
+                        + this.sampleRate + 'Hz -> a main-thread callback every '
+                        + Math.round(cbExpectMs) + 'ms. resampler='
+                        + (typeof window.waveResampler));
+                    try {
+                        var proto = Object.getPrototypeOf(node);
+                        var desc = null;
+                        while (proto && !desc) {
+                            desc = Object.getOwnPropertyDescriptor(proto, 'onaudioprocess');
+                            if (!desc) proto = Object.getPrototypeOf(proto);
+                        }
+                        if (desc && desc.set) {
+                            var last = 0;
+                            Object.defineProperty(node, 'onaudioprocess', {
+                                configurable: true,
+                                get: function () { return desc.get.call(this); },
+                                set: function (fn) {
+                                    desc.set.call(this, function (ev) {
+                                        var t0 = performance.now();
+                                        if (last) cbGap.push(t0 - last);
+                                        last = t0;
+                                        try {
+                                            return fn.call(this, ev);
+                                        } catch (err) {
+                                            // The site does not catch this. One throw per
+                                            // callback = permanent silence, no UI change.
+                                            cbErrs++;
+                                            if (!firstCbErr) {
+                                                firstCbErr = String(err);
+                                                console.log(TAG + ' onaudioprocess THREW: ' + err
+                                                    + ' | waveResampler=' + (typeof window.waveResampler));
+                                            }
+                                        } finally {
+                                            cbDur.push(performance.now() - t0);
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        console.log(TAG + ' cannot instrument onaudioprocess: ' + e);
+                    }
+                    return node;
+                };
+            }
+        } catch (e) {
+            console.log(TAG + ' cannot wrap createScriptProcessor: ' + e);
+        }
+
+        // ---- stage 4: the WebCodecs Opus encoder ------------------------------------
+        // encode() calls and the packets the output callback actually produced. These
+        // two diverging is the signature of an encoder that accepts audio and emits
+        // nothing, which the page has no way to notice.
+        var encCalls = 0, encPackets = 0, encBytes = 0;
+        try {
+            if (typeof AudioEncoder !== 'undefined') {
+                var NativeEnc = AudioEncoder;
+                var WrappedEnc = function (init) {
+                    var wrappedInit = {
+                        output: function (chunk, meta) {
+                            encPackets++;
+                            encBytes += (chunk && chunk.byteLength) || 0;
+                            return init.output.apply(this, arguments);
+                        },
+                        error: function (e) {
+                            console.log(TAG + ' AudioEncoder ERROR: ' + e
+                                + ' -- page falls back to base64 PCM from here on');
+                            return init.error.apply(this, arguments);
+                        }
+                    };
+                    var enc = new NativeEnc(wrappedInit);
+                    var origConfigure = enc.configure.bind(enc);
+                    enc.configure = function (cfg) {
+                        console.log(TAG + ' AudioEncoder.configure ' + JSON.stringify(cfg));
+                        return origConfigure(cfg);
+                    };
+                    var origEncode = enc.encode.bind(enc);
+                    enc.encode = function () {
+                        encCalls++;
+                        try {
+                            return origEncode.apply(null, arguments);
+                        } catch (e) {
+                            once('encThrow', 'AudioEncoder.encode THREW: ' + e);
+                            throw e;
+                        }
+                    };
+                    return enc;
+                };
+                WrappedEnc.isConfigSupported = function (cfg) {
+                    return NativeEnc.isConfigSupported(cfg).then(function (r) {
+                        console.log(TAG + ' AudioEncoder.isConfigSupported('
+                            + JSON.stringify(cfg) + ') -> ' + r.supported);
+                        return r;
+                    });
+                };
+                WrappedEnc.prototype = NativeEnc.prototype;
+                window.AudioEncoder = WrappedEnc;
+            } else {
+                console.log(TAG + ' no AudioEncoder in this browser'
+                    + ' -- page will use the base64 PCM fallback (~340 kbit/s uplink)');
+            }
+        } catch (e) {
+            console.log(TAG + ' cannot wrap AudioEncoder: ' + e);
+        }
+
+        // ---- stage 5: which payload actually goes up --------------------------------
+        var uploads = { opus: 0, pcm: 0, pause: 0, bytes: 0 };
+        try {
+            var origFetch = window.fetch;
+            window.fetch = function (input, init) {
+                try {
+                    var url = (typeof input === 'string') ? input : (input && input.url) || '';
+                    if (pathOf(url).indexOf('/append') >= 0 && init && typeof init.body === 'string') {
+                        uploads.bytes += init.body.length;
+                        if (init.body.indexOf('b64_enc_opus') >= 0) uploads.opus++;
+                        else if (init.body.indexOf('PAUSE') >= 0) uploads.pause++;
+                        else if (init.body.indexOf('b64_enc_pcm_s16le') >= 0) {
+                            uploads.pcm++;
+                            once('pcmPath', 'upload is using the base64 PCM FALLBACK,'
+                                + ' not Opus -- roughly 8x the uplink bitrate');
+                        }
+                    }
+                } catch (e) {}
+                return origFetch.apply(this, arguments);
+            };
+        } catch (e) {
+            console.log(TAG + ' cannot wrap fetch for payload classification: ' + e);
+        }
+
+        // ---- the site's own upload lag banner ---------------------------------------
+        // #upload-warning carries the one number nothing else exposes: how many seconds of
+        // audio a single request actually contained. Steady state is ~1s; larger means a
+        // backlog draining.
+        var lastWarning = '';
+        setInterval(function () {
+            var el = document.getElementById('upload-warning');
+            var txt = el ? (el.textContent || '').trim() : '';
+            if (txt && txt !== lastWarning) {
+                lastWarning = txt;
+                console.log(TAG + ' upload-warning: ' + txt);
+            }
+        }, 1000);
+
+        // ---- second-order: main-thread cost of transcript rendering -----------------
+        var longTasks = { n: 0, ms: 0, max: 0 };
+        try {
+            new PerformanceObserver(function (list) {
+                list.getEntries().forEach(function (e) {
+                    longTasks.n++;
+                    longTasks.ms += e.duration;
+                    if (e.duration > longTasks.max) longTasks.max = e.duration;
+                });
+            }).observe({ entryTypes: ['longtask'] });
+        } catch (e) {
+            console.log(TAG + ' longtask observer unavailable: ' + e);
+        }
+
+        // The site issues SYNCHRONOUS XMLHttpRequests from its SSE handler
+        // (get_output_language_component, get_previous_messages). Each freezes the page
+        // for a full round trip, which on this link is 150-250ms before the server starts.
+        var syncXhr = { n: 0, ms: 0 };
+        try {
+            var xhrOpen = XMLHttpRequest.prototype.open;
+            var xhrSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (method, url, async) {
+                this.__perfSync = (async === false);
+                this.__perfPath = pathOf(url);
+                return xhrOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function () {
+                if (!this.__perfSync) return xhrSend.apply(this, arguments);
+                var t0 = performance.now();
+                try {
+                    return xhrSend.apply(this, arguments);
+                } finally {
+                    var ms = performance.now() - t0;
+                    syncXhr.n++;
+                    syncXhr.ms += ms;
+                    console.log(TAG + ' SYNC-XHR ' + this.__perfPath
+                        + ' froze main thread ' + Math.round(ms) + 'ms');
+                }
+            };
+        } catch (e) {
+            console.log(TAG + ' cannot wrap XMLHttpRequest: ' + e);
+        }
+
+        // EventSource is the transcript return channel. NET_TRACE_JS wraps only fetch and
+        // WebSocket, so without this the whole downstream is invisible. Claiming the name
+        // here also keeps the page on the native implementation: the site's 279 KB
+        // eventsource-polyfill installs itself only when window.EventSource is falsy.
+        var sse = { msgs: 0, bytes: 0 };
+        try {
+            var NativeES = window.EventSource;
+            if (NativeES) {
+                var TracedES = function (url, cfg) {
+                    var es = new NativeES(url, cfg);
+                    var t0 = performance.now();
+                    es.addEventListener('open', function () {
+                        console.log(TAG + ' SSE open ' + pathOf(url)
+                            + ' after ' + Math.round(performance.now() - t0) + 'ms');
+                    });
+                    es.addEventListener('error', function () {
+                        console.log(TAG + ' SSE error on ' + pathOf(url)
+                            + ' readyState=' + es.readyState
+                            + (es.readyState === 0 ? ' (reconnecting)' : ''));
+                    });
+                    es.addEventListener('message', function (ev) {
+                        sse.msgs++;
+                        sse.bytes += (ev.data ? ev.data.length : 0);
+                    });
+                    return es;
+                };
+                TracedES.prototype = NativeES.prototype;
+                TracedES.CONNECTING = 0;
+                TracedES.OPEN = 1;
+                TracedES.CLOSED = 2;
+                window.EventSource = TracedES;
+            }
+        } catch (e) {
+            console.log(TAG + ' cannot wrap EventSource: ' + e);
+        }
+
+        // addMessage is a top-level function declaration in one of the page's inline
+        // scripts, so it lands on window -- but only once that script has run.
+        var render = [];
+        var wrapped = false, tries = 0;
+        var wrapTimer = setInterval(function () {
+            if (!wrapped && typeof window.addMessage === 'function') {
+                var orig = window.addMessage;
+                window.addMessage = function () {
+                    var t0 = performance.now();
+                    try { return orig.apply(this, arguments); }
+                    finally { render.push(performance.now() - t0); }
+                };
+                wrapped = true;
+                console.log(TAG + ' addMessage instrumented');
+            }
+            if (wrapped || ++tries > 60) clearInterval(wrapTimer);
+        }, 500);
+
+        // ---- rollup -----------------------------------------------------------------
+        setInterval(function () {
+            var parts = [];
+            parts.push('ctx=' + (ctxRef ? ctxRef.state : 'none'));
+            parts.push('resampler=' + (typeof window.waveResampler));
+            parts.push('cb=' + cbDur.length
+                + (cbDur.length ? ' ' + stat(cbDur) + ' gap ' + stat(cbGap)
+                    + ' expect=' + Math.round(cbExpectMs) + 'ms' : '')
+                + (cbErrs ? ' cbErr=' + cbErrs : ''));
+            parts.push('enc=' + encCalls + ' pkt=' + encPackets
+                + ' ' + Math.round(encBytes / 1024) + 'KB');
+            parts.push('up opus=' + uploads.opus + ' pcm=' + uploads.pcm
+                + ' pause=' + uploads.pause + ' ' + Math.round(uploads.bytes / 1024) + 'KB');
+            if (sse.msgs) parts.push('sse n=' + sse.msgs + ' ' + Math.round(sse.bytes / 1024) + 'KB');
+            if (syncXhr.n) parts.push('syncXHR n=' + syncXhr.n + ' froze=' + Math.round(syncXhr.ms) + 'ms');
+            if (longTasks.n) {
+                parts.push('longtasks=' + longTasks.n + ' blocked=' + Math.round(longTasks.ms)
+                    + 'ms max=' + Math.round(longTasks.max) + 'ms');
+            }
+            if (render.length) parts.push('addMessage n=' + render.length + ' ' + stat(render));
+            try {
+                parts.push('dom words=' + document.querySelectorAll('.word').length);
+            } catch (e) {}
+
+            // The page has an iframe (runtime-correction-setting) that will never have an
+            // AudioContext or a transcript. Staying quiet there keeps the log readable.
+            var worthPrinting = ctxRef || sse.msgs || syncXhr.n || render.length || cbDur.length;
+            if (worthPrinting) console.log(TAG + ' ' + parts.join(' | '));
+
+            cbDur = []; cbGap = [];
+            encCalls = 0; encPackets = 0; encBytes = 0;
+            uploads = { opus: 0, pcm: 0, pause: 0, bytes: 0 };
+            sse = { msgs: 0, bytes: 0 };
+            syncXhr = { n: 0, ms: 0 };
+            longTasks = { n: 0, ms: 0, max: 0 };
+            render = [];
+        }, SUMMARY_MS);
+
+        console.log(TAG + ' tracing armed');
+    })();
+""".trimIndent()
 
 private val SITE_TWEAKS_JS = """
     (function () {
@@ -267,8 +686,71 @@ private val SITE_TWEAKS_JS = """
             };
             console.log('[app-tweaks] getUserMedia patched');
         }
-        // Before killOverlays and outside setup(): this one needs no document.body, and it
-        // has to be in place before the user presses record, not merely before load ends.
+        // The page builds its AudioContext from a load-time recording() call -- see
+        // site-reference/present/inline/05-audio-capture-and-upload.js, where
+        // `new AudioContext()` runs BEFORE its own getUserMedia and nothing ever calls
+        // resume(). Under Chromium's autoplay policy a context constructed at that point,
+        // with no user activation and no capture yet in flight, starts SUSPENDED, and a
+        // suspended context never fires onaudioprocess: no audio is encoded, nothing is
+        // uploaded, the transcript stays empty and the page reports no error at all. The
+        // record button still flips to "stop", so the UI looks like it is recording.
+        //
+        // Reproduced against the vendored snapshot by tools/perf-trace-selftest.mjs,
+        // which logs "AudioContext created: state=suspended" for the page's own context
+        // while a context created later on the same page comes up running.
+        //
+        // settings.mediaPlaybackRequiresUserGesture = false relaxes the same policy for
+        // this WebView; this patch is the belt to that braces, and is also what would
+        // cover a context that gets suspended again later (the platform suspends audio
+        // on some interruptions). Retrying on user input costs nothing when the flag has
+        // already done the job.
+        function autoResumeAudioContext() {
+            if (window.__appAudioResume) return;
+            var Native = window.AudioContext || window.webkitAudioContext;
+            if (!Native) return;
+            window.__appAudioResume = true;
+            var live = [];
+            function kick(ctx, why) {
+                if (!ctx || ctx.state !== 'suspended') return;
+                var p = ctx.resume();
+                if (p && p.then) {
+                    p.then(function () {
+                        console.log('[app-tweaks] AudioContext resumed (' + why + ')');
+                    }, function (e) {
+                        console.log('[app-tweaks] AudioContext resume failed (' + why + '): ' + e);
+                    });
+                }
+            }
+            var Wrapped = function () {
+                var ctx = new Native(arguments[0]);
+                live.push(ctx);
+                console.log('[app-tweaks] AudioContext created, state=' + ctx.state);
+                kick(ctx, 'on create');
+                ctx.addEventListener('statechange', function () {
+                    console.log('[app-tweaks] AudioContext state -> ' + ctx.state);
+                    if (ctx.state === 'suspended') kick(ctx, 'statechange');
+                });
+                return ctx;
+            };
+            Wrapped.prototype = Native.prototype;
+            window.AudioContext = Wrapped;
+            if (window.webkitAudioContext) window.webkitAudioContext = Wrapped;
+
+            // Last resort: the first real user interaction always carries activation, so
+            // even a policy we cannot relax from the shell gets satisfied by one tap.
+            ['pointerdown', 'touchend', 'keydown'].forEach(function (evt) {
+                document.addEventListener(evt, function () {
+                    live.forEach(function (c) { kick(c, evt); });
+                }, { capture: true, passive: true });
+            });
+            console.log('[app-tweaks] AudioContext auto-resume armed');
+        }
+
+        // Before killOverlays and outside setup(): these need no document.body, and they
+        // have to be in place before the user presses record -- and, for the AudioContext
+        // patch, before the page's own load-time recording() call -- not merely before
+        // load ends.
+        autoResumeAudioContext();
         forceRawAudioCapture();
         killOverlays();
         // Arm on DOMContentLoaded rather than relying on a later injection: the WebView's
@@ -444,6 +926,14 @@ fun SiteWebView(
                 )
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                // Defaults to true, which blocks media from starting without a user
+                // gesture -- including an AudioContext. The wrapped page builds its
+                // AudioContext from a load-time recording() call, with no gesture
+                // anywhere in the stack, and never calls resume(), so with the default
+                // the context can stay suspended forever: no onaudioprocess, nothing
+                // uploaded, an empty transcript and no error anywhere in the page.
+                // PERF_TRACE_JS's ctx= field reports the state this actually produces.
+                settings.mediaPlaybackRequiresUserGesture = false
                 // Lets the live page be inspected via chrome://inspect#devices on a
                 // connected computer, e.g. to diagnose page-injection issues.
                 val isDebuggable =
@@ -522,7 +1012,11 @@ fun SiteWebView(
                         // this very first injection can land before the document exists.
                         if (isDebuggable) {
                             view.evaluateJavascript(NET_TRACE_JS, null)
+                            // Before the site's own scripts run: PERF_TRACE_JS has to claim
+                            // createScriptProcessor and EventSource ahead of the page.
+                            view.evaluateJavascript(PERF_TRACE_JS, null)
                             view.postDelayed({ view.evaluateJavascript(NET_TRACE_JS, null) }, 2000)
+                            view.postDelayed({ view.evaluateJavascript(PERF_TRACE_JS, null) }, 2000)
                         }
                         if (darkReaderInjectJs != null) {
                             view.evaluateJavascript(darkReaderInjectJs, null)
