@@ -88,6 +88,131 @@ private fun injectDarkReaderJs(bundle: String): String = """
 //
 // The MutationObserver on <body> catches overlays that are inserted asynchronously
 // after load (consent dialogs, cookie banners, promo popups).
+// Network tracing for debug builds: wraps fetch and WebSocket and reports through the page
+// console, which MainActivity already forwards to logcat. This exists because the usual
+// answer -- chrome://inspect#devices -- needs a desktop Chrome that is not always available,
+// and on this app's slow mobile link (see CLAUDE.md, "Operating environment") the network
+// layer is exactly where the interesting failures are.
+//
+// Deliberately compact: per-request lines only for failures, non-2xx and slow requests, plus
+// a rolled-up line per endpoint every 5s. A continuous audio upload would otherwise produce
+// hundreds of lines a minute and drown the rest of the log.
+//
+// Logs metadata only -- method, path, status, duration, byte counts. Never headers, never
+// bodies, so nothing here can leak a session token into a log file you send onward.
+private val NET_TRACE_JS = """
+    (function () {
+        if (window.__appNetTrace) return;
+        window.__appNetTrace = true;
+        var TAG = '[net]';
+        var SUMMARY_MS = 5000;
+        var SLOW_MS = 2000;
+        var buckets = {};
+        var wsCount = 0;
+
+        function bucket(key) {
+            if (!buckets[key]) buckets[key] = { n: 0, err: 0, up: 0, down: 0, ms: [] };
+            return buckets[key];
+        }
+        function pathOf(url) {
+            try { return new URL(url, location.href).pathname; }
+            catch (e) { return String(url); }
+        }
+        // Approximate: string length is characters, not bytes. Good enough to spot an
+        // upload that is far bigger or smaller than expected.
+        function bodySize(body) {
+            try {
+                if (!body) return 0;
+                if (typeof body === 'string') return body.length;
+                if (body.byteLength != null) return body.byteLength;
+                if (body.size != null) return body.size;
+            } catch (e) {}
+            return 0;
+        }
+        function quantile(sorted, q) {
+            if (!sorted.length) return 0;
+            return Math.round(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]);
+        }
+
+        var origFetch = window.fetch;
+        if (origFetch) {
+            window.fetch = function (input, init) {
+                var method = (init && init.method) || (input && input.method) || 'GET';
+                var key = method + ' ' + pathOf((input && input.url) || input);
+                var up = bodySize(init && init.body);
+                var b = bucket(key);
+                var t0 = performance.now();
+                return origFetch.apply(this, arguments).then(function (res) {
+                    var dt = performance.now() - t0;
+                    b.n++; b.up += up; b.ms.push(dt);
+                    var len = 0;
+                    try { len = parseInt(res.headers.get('content-length'), 10) || 0; } catch (e) {}
+                    b.down += len;
+                    if (!res.ok) {
+                        console.log(TAG + ' HTTP ' + res.status + ' ' + key + ' ' + Math.round(dt) + 'ms');
+                    } else if (dt >= SLOW_MS) {
+                        console.log(TAG + ' SLOW ' + key + ' ' + Math.round(dt) + 'ms up=' + up + 'B');
+                    }
+                    return res;
+                }, function (err) {
+                    var dt = performance.now() - t0;
+                    b.n++; b.err++; b.ms.push(dt);
+                    // The line that distinguishes a real transport failure from a fetch
+                    // aborted by navigation: a navigation abort lands within a millisecond
+                    // or two of a visibilitychange, a dead link does not.
+                    console.log(TAG + ' FAIL ' + key + ' after ' + Math.round(dt) + 'ms: ' + err);
+                    throw err;
+                });
+            };
+        }
+
+        var OrigWS = window.WebSocket;
+        if (OrigWS) {
+            var PatchedWS = function (url, protocols) {
+                var ws = (protocols === undefined) ? new OrigWS(url) : new OrigWS(url, protocols);
+                var id = ++wsCount;
+                var path = pathOf(url);
+                var b = bucket('WS ' + path);
+                var t0 = performance.now();
+                console.log(TAG + ' WS#' + id + ' connecting ' + path);
+                ws.addEventListener('open', function () {
+                    console.log(TAG + ' WS#' + id + ' open after ' + Math.round(performance.now() - t0) + 'ms');
+                });
+                ws.addEventListener('message', function (ev) {
+                    b.n++;
+                    var d = ev.data;
+                    b.down += (typeof d === 'string') ? d.length : ((d && (d.byteLength || d.size)) || 0);
+                });
+                ws.addEventListener('error', function () {
+                    b.err++;
+                    console.log(TAG + ' WS#' + id + ' ERROR');
+                });
+                ws.addEventListener('close', function (ev) {
+                    console.log(TAG + ' WS#' + id + ' closed code=' + ev.code + ' clean=' + ev.wasClean);
+                });
+                return ws;
+            };
+            PatchedWS.prototype = OrigWS.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { PatchedWS[k] = OrigWS[k]; });
+            window.WebSocket = PatchedWS;
+        }
+
+        setInterval(function () {
+            Object.keys(buckets).forEach(function (key) {
+                var b = buckets[key];
+                if (!b.n) return;
+                var sorted = b.ms.slice().sort(function (x, y) { return x - y; });
+                console.log(TAG + ' ' + key + ' n=' + b.n + ' err=' + b.err
+                    + (sorted.length ? ' p50=' + quantile(sorted, 0.5) + 'ms max=' + quantile(sorted, 1) + 'ms' : '')
+                    + ' up=' + Math.round(b.up / 1024) + 'KB down=' + Math.round(b.down / 1024) + 'KB');
+                buckets[key] = { n: 0, err: 0, up: 0, down: 0, ms: [] };
+            });
+        }, SUMMARY_MS);
+
+        console.log(TAG + ' tracing armed');
+    })();
+""".trimIndent()
+
 private val SITE_TWEAKS_JS = """
     (function () {
         function killOverlays() {
@@ -392,6 +517,13 @@ fun SiteWebView(
 
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                         super.onPageStarted(view, url, favicon)
+                        // First, so fetch and WebSocket are wrapped before the site's own
+                        // scripts run. Re-posted once for the same reason the tweaks are:
+                        // this very first injection can land before the document exists.
+                        if (isDebuggable) {
+                            view.evaluateJavascript(NET_TRACE_JS, null)
+                            view.postDelayed({ view.evaluateJavascript(NET_TRACE_JS, null) }, 2000)
+                        }
                         if (darkReaderInjectJs != null) {
                             view.evaluateJavascript(darkReaderInjectJs, null)
                             view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
