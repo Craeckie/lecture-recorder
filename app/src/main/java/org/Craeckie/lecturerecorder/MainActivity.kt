@@ -134,11 +134,43 @@ private val NET_TRACE_JS = """
             return Math.round(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]);
         }
 
+        // Response BODIES for a small allow-list of paths, so tools/mock-server.mjs can be
+        // corrected against what the server really returns instead of what the page's code
+        // implies. Everything else in this tracer is metadata only, deliberately: a logcat
+        // export must not carry transcript text or a session token.
+        //
+        // Which is why this list holds ONLY /append, whose response is an upload ack.
+        // /get_previous_messages and /webapi/stream carry lecture content -- do not add
+        // them without deciding that is acceptable for the log you are about to export.
+        var BODY_PATHS = ['/append'];
+        var BODY_MAX = 400;
+        var BODY_SAMPLES = 3;
+        var bodySeen = {};
+        function maybeLogBody(key, path, res) {
+            if (!BODY_PATHS.some(function (s) { return path.indexOf(s) >= 0; })) return;
+            bodySeen[path] = (bodySeen[path] || 0) + 1;
+            // A lecture is an hour of these. Three samples is enough to see whether the
+            // shape varies between requests, and bounds what this can add to a log.
+            if (bodySeen[path] > BODY_SAMPLES) return;
+            var n = bodySeen[path];
+            try {
+                // clone() so the page still gets to read its own response body.
+                res.clone().text().then(function (t) {
+                    console.log(TAG + ' BODY ' + key + ' ' + res.status
+                        + ' [' + n + '/' + BODY_SAMPLES + '] '
+                        + JSON.stringify(String(t).slice(0, BODY_MAX)));
+                }, function (e) {
+                    console.log(TAG + ' BODY ' + key + ' unreadable: ' + e);
+                });
+            } catch (e) {}
+        }
+
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function (input, init) {
                 var method = (init && init.method) || (input && input.method) || 'GET';
-                var key = method + ' ' + pathOf((input && input.url) || input);
+                var path = pathOf((input && input.url) || input);
+                var key = method + ' ' + path;
                 var up = bodySize(init && init.body);
                 var b = bucket(key);
                 var t0 = performance.now();
@@ -148,6 +180,7 @@ private val NET_TRACE_JS = """
                     var len = 0;
                     try { len = parseInt(res.headers.get('content-length'), 10) || 0; } catch (e) {}
                     b.down += len;
+                    maybeLogBody(key, path, res);
                     if (!res.ok) {
                         console.log(TAG + ' HTTP ' + res.status + ' ' + key + ' ' + Math.round(dt) + 'ms');
                     } else if (dt >= SLOW_MS) {
