@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
@@ -1583,6 +1584,16 @@ private fun isNightMode(context: Context): Boolean =
     (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
         Configuration.UI_MODE_NIGHT_YES
 
+// The manifest's VIEW intent-filter matches the whole lt2srv.iar.kit.edu host (short
+// links, /present/<id>, ...), but only a VIEW intent actually carries a link to open --
+// the launcher MAIN intent has no data at all. Anything else falls back to SITE_URL.
+private fun launchUrl(intent: Intent?): String {
+    val data = intent?.data ?: return SITE_URL
+    if (data.scheme != "http" && data.scheme != "https") return SITE_URL
+    if (data.host != Uri.parse(SITE_URL).host) return SITE_URL
+    return data.toString()
+}
+
 class MainActivity : ComponentActivity() {
     private lateinit var micRouter: MicRouter
     private lateinit var micDiagnostics: MicDiagnostics
@@ -1644,6 +1655,7 @@ class MainActivity : ComponentActivity() {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Box(modifier = Modifier.padding(innerPadding)) {
                         SiteWebView(
+                            startUrl = launchUrl(intent),
                             onAudioPermissionRequest = ::handleWebAudioPermission,
                             micBridge = micBridge,
                             captureActive = captureActive,
@@ -1815,6 +1827,7 @@ private val CAPTURE_MODE_CHOICES: List<Pair<String?, String>> = listOf(
 @Composable
 fun SiteWebView(
     modifier: Modifier = Modifier,
+    startUrl: String = SITE_URL,
     onAudioPermissionRequest: (PermissionRequest) -> Unit,
     micBridge: MicBridge,
     captureActive: Boolean = false,
@@ -2025,7 +2038,7 @@ fun SiteWebView(
                         canGoBack = view.canGoBack()
                     }
                 }
-                loadUrl(SITE_URL)
+                loadUrl(startUrl)
                 webView = this
             }
         },

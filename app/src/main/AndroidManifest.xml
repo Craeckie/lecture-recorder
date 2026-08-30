@@ -41,6 +41,18 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Lets links to the wrapped site (e.g. the /webapi/shorten/<id> short links
+                 handed out for QR codes) open directly in this app instead of a browser.
+                 No autoVerify: that requires a Digital Asset Links file hosted on
+                 lt2srv.iar.kit.edu, which this app doesn't control, so Android shows the
+                 usual app chooser rather than claiming the link silently. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="lt2srv.iar.kit.edu" />
+            </intent-filter>
         </activity>
 
     </application>
