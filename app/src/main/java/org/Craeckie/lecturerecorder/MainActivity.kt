@@ -725,6 +725,544 @@ private val PERF_TRACE_JS = """
     })();
 """.trimIndent()
 
+// The transcript renderer the wrapped site ships is quadratic in session length: it
+// redoes full passes over the accumulated transcript on every incoming message, and
+// auto-scrolls by writing scrollTop inline, which forces a synchronous layout ~4x per
+// ASR cycle. That work lands on the same main thread as the ScriptProcessorNode audio
+// callback, which DROPS input it cannot collect in time -- so a long lecture starts
+// eating its own audio. Measured, fixed and regression-tested in tools/; see
+// CLAUDE.md "the transcript renderer is quadratic" for the numbers.
+//
+// Kept as its own constant rather than folded into SITE_TWEAKS_JS so the harnesses in
+// tools/ can extract and drive exactly the JS the app ships (tools/kotlin-js.mjs).
+private val RENDERER_FIX_JS = """
+    // renderer-fix.js -- removes the per-message O(n)/O(chapters) work from the wrapped
+    // site's transcript renderer so a 90-minute lecture does not degrade.
+    //
+    // Context: see ../CLAUDE.md ("Known second-order problem: the transcript renderer is
+    // quadratic") and tools/README.md. The renderer's own functions
+    // (show_text, add_selecting_word_action, addMessage, createChapterElement,
+    // clearMarkupWindow) are plain top-level `function` declarations in the wrapped page --
+    // not inside an IIFE -- so they are real `window` properties, and reassigning
+    // `window.<name> = ...` takes effect for calls made from *inside* the site's own code,
+    // because those internal calls resolve the identifier through the shared global
+    // environment. Verified empirically (see tools/renderer-equivalence-check.mjs and the
+    // probes run while developing this file) before relying on it here.
+    //
+    // HARD REQUIREMENTS this file honours:
+    //   - ES5-only for OUR OWN code (no arrow functions, no template literals, no optional
+    //     chaining, no let/const at file scope where it would matter) -- injected into an
+    //     Android WebView via evaluateJavascript. The one exception is the *rebuilt*
+    //     addMessage body below, which is the SITE's own ES6 source text re-evaluated
+    //     verbatim (minus a few substituted lines) -- that's not new code we're authoring,
+    //     and the WebView already runs the site's ES6 elsewhere.
+    //   - Fully idempotent: this whole file is injected multiple times per page load
+    //     (onPageStarted, +2s, +10s, onPageFinished). Every install step below guards itself
+    //     so re-running is always a safe no-op.
+    //   - Must never throw: shares an injection with the app's capture fixes
+    //     (patchAudioContext / applyCaptureMode in SITE_TWEAKS_JS); an uncaught exception
+    //     here must not be able to take those out. Everything is wrapped in try/catch and
+    //     degrades to leaving the site's original functions in place.
+    //   - The site's functions may not exist yet when this first runs -- each install step
+    //     reports whether it actually ran, and the bottom of the file retries on a schedule
+    //     until everything is installed.
+    //
+    // What is intentionally NOT touched: update_speaker_tag / updateSpeakerTagsForSection.
+    // It rebuilds speaker tags across every chapter and is potentially the heaviest
+    // per-call cost, but it only fires when messages carry `speakerName`, retroactive
+    // `refined_sentence_cluster` corrections can invalidate chapters other than the
+    // current one, and there is no bench coverage for it here -- an incremental version
+    // would not be safely verifiable with what this repo has. See CLAUDE.md's "explicitly
+    // out of scope" note.
+
+    (function () {
+      // Deliberately NOT 'use strict': installAddMessageRewrite() below rebuilds addMessage
+      // via a direct `eval`, which inherits strict-mode-ness from its call site. The site's
+      // own addMessage relies on at least one undeclared-global assignment
+      // (`unstable = document.getElementById(...)`, no var/let/const) that is a hard error
+      // in strict mode. Running non-strict here matches the sloppy mode the site's own
+      // scripts run in, so the rebuilt function behaves exactly like the original.
+
+      function log(msg) {
+        try { console.log('[renderer-fix] ' + msg); } catch (e) { /* console unavailable */ }
+      }
+
+      if (!window.__rendererFix) {
+        window.__rendererFix = { installed: false };
+      }
+      if (window.__rendererFix.installed) {
+        return; // already fully installed by an earlier injection -- nothing to do
+      }
+
+      // ---------------------------------------------------------------------------------
+      // Hotspot #1: show_text() -- O(n) insertion-point scan on every stable message.
+      //
+      // The original does:
+      //   const spans = w.getElementsByTagName('span');
+      //   ... var l = spans.length;
+      //   for (var i = 0; i < l; i++) if (parseFloat(spans[i].getAttribute("start")) < start) last = i;
+      //   spans[last].after(newSpan)
+      // ASR timestamps increase monotonically, so in the common case the right insertion
+      // point is simply "right after whatever we inserted last time". We cache that per
+      // window element and only fall back to the full scan when the cache is missing,
+      // stale (its node got detached -- covers action==="remove"/"replace", the
+      // `w.innerHTML = ""` CLEAR path, and clearMarkupWindow, all of which restructure the
+      // window and are caught for free by "is the cached node still w's child"), or the
+      // incoming start is behind the cached start (an out-of-order backfill from
+      // get_previous_messages).
+      // ---------------------------------------------------------------------------------
+      function installShowTextCache() {
+        if (typeof window.show_text !== 'function') return false; // site not loaded yet
+        if (window.show_text.__rendererFixWrapped) return true; // already patched
+
+        var original = window.show_text;
+        var cache = typeof WeakMap === 'function' ? new WeakMap() : null;
+        if (!cache) return true; // no WeakMap available -- leave original in place, permanently
+
+        function fastAdd(w, seq, start, end, type, spk, additionalClasses) {
+          var newSpan = document.createElement(type);
+          newSpan.innerHTML = seq;
+          newSpan.setAttribute('start', start);
+          newSpan.setAttribute('end', end);
+          newSpan.setAttribute('speaker-title', spk);
+          for (var c = 0; c < additionalClasses.length; c++) newSpan.classList.add(additionalClasses[c]);
+
+          // Same blank-content early return the original has, before any insertion.
+          if (newSpan.innerHTML.trim() === '') return undefined;
+
+          var entry = cache.get(w);
+          var cacheValid = !!(entry && entry.node && entry.node.parentNode === w);
+
+          if (cacheValid && start >= entry.start) {
+            entry.node.after(newSpan);
+            cache.set(w, { node: newSpan, start: start });
+            return newSpan;
+          }
+
+          // Fallback: identical full scan to the original. Note this scan is over ALL
+          // descendant <span> elements, not just w's direct children: each inserted
+          // top-level span (class plain_transcript, carrying the start/end attributes) has
+          // its own per-word <span class="word"> children with NO start attribute, and
+          // getElementsByTagName is recursive, so the flat list interleaves top-level
+          // wrapper spans with their nested word spans. parseFloat(null) is NaN and
+          // `NaN < start` is always false, so nested word spans never win the `last` index
+          // below -- exactly like the original, which has the same property.
+          var spans = w.getElementsByTagName('span');
+          var l = spans.length;
+          if (l === 0) {
+            w.appendChild(newSpan);
+            cache.set(w, { node: newSpan, start: start }); // trivially the new rightmost span
+            return newSpan;
+          }
+          var last = 0;
+          // lastWrapperIdx tracks the highest index of ANY element that has a real (non-NaN)
+          // start attribute -- i.e. any top-level wrapper span, regardless of whether it lost
+          // the `last` comparison. This is what "was the insertion at the true end" needs to
+          // check against -- NOT `l - 1`, which is the index of the last *nested word* span
+          // when the wrapper we just inserted after already has word children (the common
+          // case): those nested children sort after their own wrapper in document order, so
+          // `l - 1` almost never equals the wrapper's own index even when it genuinely is the
+          // last wrapper. Comparing against the last WRAPPER index instead of the last NODE
+          // index is what makes this correct.
+          var lastWrapperIdx = -1;
+          for (var i = 0; i < l; i++) {
+            var sv = parseFloat(spans[i].getAttribute('start'));
+            if (!isNaN(sv)) {
+              lastWrapperIdx = i;
+              if (sv < start) last = i;
+            }
+          }
+          spans[last].after(newSpan);
+          // Only trust this as the new "rightmost" cache entry if the wrapper we just
+          // inserted after was itself the last wrapper span overall -- i.e. this was NOT a
+          // backfill into the middle of the window. If it was, the true rightmost span is
+          // unchanged, so leave any existing cache entry alone rather than pointing it at
+          // the wrong (earlier) node.
+          if (lastWrapperIdx === -1 || last === lastWrapperIdx) {
+            cache.set(w, { node: newSpan, start: start });
+          }
+          return newSpan;
+        }
+
+        function fastShowText(w, seq, start, end, type, action, spk, additionalClasses) {
+          if (type === undefined) type = 'span';
+          if (action === undefined) action = 'add';
+          if (!additionalClasses) additionalClasses = [];
+
+          if (action !== 'add') {
+            // remove/replace are rare (site-internal corrections), can reorder or delete
+            // spans, and are not part of the hot path this fix targets. Delegate to the
+            // site's own implementation unchanged -- including whatever the site's own
+            // pre-existing behaviour is (e.g. the `replace` branch reads a variable,
+            // isMouseDown, that is never declared anywhere in either vendored capture --
+            // a latent bug in the site itself, not something to paper over here).
+            if (cache.has(w)) cache.delete(w); // conservative: might reorder/delete spans
+            return original.call(this, w, seq, start, end, type, action, spk, additionalClasses);
+          }
+
+          try {
+            return fastAdd(w, seq, start, end, type, spk, additionalClasses);
+          } catch (e) {
+            log('show_text fast path threw, falling back to original: ' + (e && e.message));
+            if (cache.has(w)) cache.delete(w);
+            return original.call(this, w, seq, start, end, type, action, spk, additionalClasses);
+          }
+        }
+
+        fastShowText.__rendererFixWrapped = true;
+        window.show_text = fastShowText;
+        return true;
+      }
+
+      // ---------------------------------------------------------------------------------
+      // Hotspot #2: add_selecting_word_action() -- re-queries every `.word` in the window
+      // on every stable message, then guards per-node with `word.eventListenersAdded`. The
+      // guard does not save the query itself, which is the actual O(n) cost. Fixed with
+      // event delegation: bind mouseover/mouseout/contextmenu ONCE per window container and
+      // resolve the word via event.target.closest('.word'); the original function becomes
+      // a one-time delegator.
+      //
+      // The handler bodies reference module-private state from the site's own script
+      // (customMenu, highlightedWord, post_message, word_) as bare identifiers -- these are
+      // top-level const/let/var in the page's *other* inline <script> blocks, not `window`
+      // properties, but classic (non-module) <script> tags in one document share a single
+      // Global Environment, so they resolve correctly from here too (verified empirically:
+      // typeof customMenu / post_message / word_ / highlightedWord all resolve to their
+      // real values from an independently-evaluated script in the same page). The
+      // contextmenu handler still does its own document.querySelectorAll('.word') scan --
+      // left alone deliberately, since it only runs on an actual right-click, not per
+      // message.
+      // ---------------------------------------------------------------------------------
+      function installWordDelegation() {
+        if (typeof window.add_selecting_word_action !== 'function') return false;
+        if (window.add_selecting_word_action.__rendererFixWrapped) return true;
+
+        function closestWord(node) {
+          while (node && node.nodeType === 1) {
+            if (node.classList && node.classList.contains('word')) return node;
+            node = node.parentNode;
+          }
+          return null;
+        }
+
+        function delegate(w) {
+          if (w.__rendererFixWordDelegated) return;
+          w.__rendererFixWordDelegated = true;
+
+          w.addEventListener('mouseover', function (e) {
+            var word = closestWord(e.target);
+            if (!word) return;
+            if (!highlightedWord) {
+              word.classList.add('highlight');
+            }
+          });
+
+          w.addEventListener('mouseout', function (e) {
+            var word = closestWord(e.target);
+            if (!word) return;
+            if (!highlightedWord || highlightedWord !== word) {
+              word.classList.remove('highlight');
+            }
+          });
+
+          w.addEventListener('contextmenu', function (e) {
+            var word = closestWord(e.target);
+            if (!word) return;
+            e.preventDefault();
+            customMenu.style.display = 'block';
+            customMenu.style.left = e.pageX + 'px';
+            customMenu.style.top = e.pageY + 'px';
+
+            var wordOrder = word.getAttribute('word-order');
+            var text = word.innerText;
+            var session_id = word.getAttribute('word-session-id');
+            var stream_id = word.getAttribute('word-stream-id');
+
+            var allWordsRaw = document.querySelectorAll('.word');
+            var all_words = [];
+            for (var i = 0; i < allWordsRaw.length; i++) {
+              var ww = allWordsRaw[i];
+              if (ww.getAttribute('word-session-id') === session_id && ww.getAttribute('word-stream-id') === stream_id) {
+                all_words.push(ww);
+              }
+            }
+            var word_order = [];
+            for (var j = 0; j < all_words.length; j++) word_order.push(all_words[j].getAttribute('word-order'));
+            var minOrder = Math.min.apply(Math, word_order);
+            var maxOrder = Math.max.apply(Math, word_order);
+            var all_word_order = [minOrder, maxOrder];
+            var profileSelect = document.getElementById('profile');
+            var profile_id = '' || (profileSelect ? profileSelect.value : '');
+
+            if (highlightedWord) {
+              highlightedWord.classList.remove('highlight');
+            }
+            highlightedWord = word;
+            word.classList.add('highlight');
+
+            post_message = {
+              text: text, wordOrder: wordOrder, session_id: session_id, stream_id: stream_id,
+              all_word_order: all_word_order, profile_id: profile_id
+            };
+            word_ = word;
+          });
+        }
+
+        function wrapped(w) {
+          try {
+            if (w === null || w === undefined) return;
+            // Same "is this UI even present" guard the original used -- if none of these
+            // exist, the original never wired up any listeners either.
+            if (document.getElementById('turn-setting') === null &&
+                document.getElementById('context-setting') === null &&
+                document.getElementById('correction-setting') === null) {
+              return;
+            }
+            delegate(w);
+          } catch (e) {
+            log('add_selecting_word_action delegation threw: ' + (e && e.message));
+          }
+        }
+
+        wrapped.__rendererFixWrapped = true;
+        window.add_selecting_word_action = wrapped;
+        return true;
+      }
+
+      // ---------------------------------------------------------------------------------
+      // Hotspot #3 (scroll-to-bottom) + #4 (.text-original re-query), folded into one
+      // source-level rewrite of addMessage() because both live inside that one large
+      // function body:
+      //
+      //  #3: `wAtBottom`/`wMarkupAtBottom` are computed from scrollHeight/clientHeight/
+      //      scrollTop on EVERY call (both stable and partial branches), and the
+      //      `el.scrollTop = el.scrollHeight` writes run on both branches too -- BOTH force
+      //      synchronous layout. The read forces it obviously; the write is less obvious but
+      //      just as real in Blink: writing scrollTop must clamp to the current scroll
+      //      range, which requires up-to-date layout, exactly like reading scrollHeight
+      //      does. (An earlier version of this file assumed a sentinel write -- `el.scrollTop
+      //      = 1e9` -- would dodge that cost. Measured on-device, it did not: ~18ms of a
+      //      ~2700ms final bucket was in any named function, the rest was this write,
+      //      forced on both branches, ~4x per ASR cycle.)
+      //
+      //      Fix, both sides: the READ is backed by a value tracked from a 'scroll'
+      //      listener (updated only when a real scroll event fires) instead of a fresh
+      //      layout read every message -- this is the at-bottom DECISION, made once per
+      //      addMessage call, exactly where the original decided it. The WRITE is coalesced
+      //      into a requestAnimationFrame: at most one pending write per container, so N
+      //      messages in one frame collapse into a single scrollTop write, which lands at a
+      //      point where the browser was already about to do layout to paint -- it stops
+      //      being a *forced synchronous* layout in the middle of addMessage. See
+      //      scheduleScrollToBottom() below.
+      //
+      //  #4: the unstable/partial path re-queries `wMarkup.querySelectorAll('.text-original')`
+      //      then takes `field[field.length - 1]` -- O(chapters), a smaller win than #1/#2,
+      //      done here because the rewrite already has to touch this function. Cached per
+      //      wMarkup, invalidated when a chapter is added (createChapterElement) or the
+      //      window is wiped (clearMarkupWindow).
+      //
+      // Mechanism: addMessage is a plain top-level function (not inside an IIFE), so
+      // Function.prototype.toString() returns its exact original source text. We take that
+      // text, substitute a small number of exact-match lines, and re-create the function
+      // with `eval`. A function created this way still resolves free identifiers (show_text,
+      // manager, sender, createChapterElement, ...) through the page's single shared global
+      // environment -- confirmed empirically before relying on this (see
+      // tools/renderer-equivalence-check.mjs) -- so it behaves exactly like the original
+      // function would, except for the substituted lines.
+      //
+      // If the site's addMessage doesn't contain every expected pattern (the live site has
+      // drifted from what this was written against), we do NOT apply a partial rewrite --
+      // we leave the original addMessage untouched and log loudly, rather than risk
+      // silently breaking scrolling or rendering.
+      // ---------------------------------------------------------------------------------
+      function installAddMessageRewrite() {
+        if (typeof window.addMessage !== 'function') return false;
+        if (window.addMessage.__rendererFixWrapped) return true;
+
+        // --- at-bottom tracking, backing hotspot #3's read side ---
+        var atBottom = typeof WeakMap === 'function' ? new WeakMap() : null;
+        if (!atBottom) return true; // no WeakMap -- leave addMessage untouched, permanently
+
+        function ensureTracked(el) {
+          if (!el || el.__rendererFixBottomTracked) return;
+          el.__rendererFixBottomTracked = true;
+          function recompute() {
+            try {
+              atBottom.set(el, (el.scrollHeight - el.clientHeight) <= (el.scrollTop + 1));
+            } catch (e) { /* ignore */ }
+          }
+          recompute(); // one-time seed read, amortized over the whole session
+          el.addEventListener('scroll', recompute, { passive: true });
+        }
+
+        window.__rendererFixAtBottom = function (el) {
+          if (!el) return true;
+          ensureTracked(el);
+          return atBottom.has(el) ? atBottom.get(el) : true;
+        };
+
+        // --- coalesced scroll-to-bottom writes, replacing the sentinel-write attempt ---
+        // A sentinel write (`el.scrollTop = 1e9`) does NOT avoid forcing layout in Blink:
+        // writing scrollTop must clamp to the current scroll range, which requires
+        // up-to-date layout just like reading scrollHeight does. Measured on-device (see the
+        // coordinator's profile): with the sentinel write in place, ~18ms of a ~2700ms final
+        // bucket was in any named function -- the rest was this write, forced on both the
+        // partial and stable branches (~4x per ASR cycle). Fix: coalesce the write into a
+        // requestAnimationFrame, at most one pending write per container. The at-bottom
+        // DECISION still happens at schedule time (addMessage's own wAtBottom/
+        // wMarkupAtBottom check, backed by window.__rendererFixAtBottom above, itself backed
+        // by a scroll listener, not a fresh layout read) -- only the WRITE is deferred to the
+        // next frame, where the browser was going to do layout anyway to paint. This means a
+        // message arriving while the user is scrolled up never schedules a write at all, and
+        // multiple messages within one frame collapse into a single write.
+        var scrollScheduled = typeof WeakMap === 'function' ? new WeakMap() : null;
+
+        function scheduleScrollToBottom(el) {
+          if (!el) return;
+          if (typeof requestAnimationFrame !== 'function' || !scrollScheduled) {
+            // No rAF (or no WeakMap) available -- fall back to the immediate write this
+            // replaces. Still correct, just not coalesced.
+            try { el.scrollTop = el.scrollHeight; } catch (e) { /* ignore */ }
+            return;
+          }
+          if (scrollScheduled.get(el)) return; // a write for this container is already pending
+          scrollScheduled.set(el, true);
+          requestAnimationFrame(function () {
+            scrollScheduled.set(el, false);
+            try { el.scrollTop = el.scrollHeight; } catch (e) { /* ignore */ }
+          });
+        }
+
+        window.__rendererFixScheduleScroll = scheduleScrollToBottom;
+
+        // --- last .text-original cache, backing hotspot #4 ---
+        var textOriginalCache = typeof WeakMap === 'function' ? new WeakMap() : null;
+        window.__rendererFixLastTextOriginal = function (wMarkup) {
+          if (!textOriginalCache) {
+            return wMarkup.querySelectorAll('.text-original'); // no WeakMap -- behave as original
+          }
+          var cached = textOriginalCache.get(wMarkup);
+          if (cached && wMarkup.contains(cached)) {
+            return [cached];
+          }
+          var fields = wMarkup.querySelectorAll('.text-original');
+          var last = fields.length ? fields[fields.length - 1] : undefined;
+          textOriginalCache.set(wMarkup, last);
+          return [last];
+        };
+
+        function invalidateTextOriginal(wMarkup) {
+          if (textOriginalCache && wMarkup) textOriginalCache.delete(wMarkup);
+        }
+
+        if (typeof window.createChapterElement === 'function' && !window.createChapterElement.__rendererFixWrapped) {
+          var origCreateChapterElement = window.createChapterElement;
+          var wrappedCCE = function (language) {
+            var result = origCreateChapterElement.apply(this, arguments);
+            try {
+              invalidateTextOriginal(document.getElementById('window-content-structured-' + language));
+            } catch (e) { /* ignore */ }
+            return result;
+          };
+          wrappedCCE.__rendererFixWrapped = true;
+          window.createChapterElement = wrappedCCE;
+        }
+
+        if (typeof window.clearMarkupWindow === 'function' && !window.clearMarkupWindow.__rendererFixWrapped) {
+          var origClearMarkupWindow = window.clearMarkupWindow;
+          var wrappedCMW = function (index) {
+            try {
+              invalidateTextOriginal(document.getElementById('window-content-structured-' + index));
+            } catch (e) { /* ignore */ }
+            return origClearMarkupWindow.apply(this, arguments);
+          };
+          wrappedCMW.__rendererFixWrapped = true;
+          window.clearMarkupWindow = wrappedCMW;
+        }
+
+        // --- the source rewrite itself ---
+        var src;
+        try {
+          src = window.addMessage.toString();
+        } catch (e) {
+          return true; // can't introspect the function -- give up permanently, safely
+        }
+
+        var linePatches = [
+          ['const wAtBottom = w.scrollHeight - w.clientHeight <= w.scrollTop + 1;',
+            'const wAtBottom = window.__rendererFixAtBottom(w);'],
+          ['const wMarkupAtBottom = wMarkup.scrollHeight - wMarkup.clientHeight <= wMarkup.scrollTop + 1;',
+            'const wMarkupAtBottom = window.__rendererFixAtBottom(wMarkup);'],
+          ['w.scrollTop = w.scrollHeight;', 'window.__rendererFixScheduleScroll(w);'],
+          ['wMarkup.scrollTop = wMarkup.scrollHeight;', 'window.__rendererFixScheduleScroll(wMarkup);']
+        ];
+
+        var newSrc = src;
+        var appliedCount = 0;
+        for (var i = 0; i < linePatches.length; i++) {
+          if (newSrc.indexOf(linePatches[i][0]) !== -1) {
+            newSrc = newSrc.split(linePatches[i][0]).join(linePatches[i][1]);
+            appliedCount++;
+          }
+        }
+
+        var textOriginalNeedle = 'const field = wMarkup.querySelectorAll(`.text-original`)';
+        var textOriginalCount = newSrc.split(textOriginalNeedle).length - 1;
+        if (textOriginalCount > 0) {
+          newSrc = newSrc.split(textOriginalNeedle).join('const field = window.__rendererFixLastTextOriginal(wMarkup)');
+        }
+
+        if (appliedCount < linePatches.length || textOriginalCount === 0) {
+          log('addMessage source did not match all expected patterns (scroll patches ' +
+            appliedCount + '/' + linePatches.length + ', text-original matches ' + textOriginalCount +
+            '); leaving addMessage unpatched (hotspot #1/#2 fixes still apply)');
+          return true; // permanent, informed skip -- not something retrying will fix
+        }
+
+        var rebuilt;
+        try {
+          rebuilt = eval('(' + newSrc + ')'); // eslint-disable-line no-eval
+        } catch (e) {
+          log('failed to rebuild addMessage, leaving original in place: ' + (e && e.message));
+          return true;
+        }
+        if (typeof rebuilt !== 'function') return true;
+
+        rebuilt.__rendererFixWrapped = true;
+        window.addMessage = rebuilt;
+        return true;
+      }
+
+      function tryInstall() {
+        var okShowText = false, okDelegation = false, okAddMessage = false;
+        try { okShowText = installShowTextCache(); } catch (e) { log('installShowTextCache threw: ' + (e && e.message)); }
+        try { okDelegation = installWordDelegation(); } catch (e) { log('installWordDelegation threw: ' + (e && e.message)); }
+        try { okAddMessage = installAddMessageRewrite(); } catch (e) { log('installAddMessageRewrite threw: ' + (e && e.message)); }
+
+        if (okShowText && okDelegation && okAddMessage) {
+          window.__rendererFix.installed = true;
+          log('installed (show_text cache, word-action delegation, addMessage scroll/text-original rewrite)');
+        } else {
+          log('partial install (show_text=' + okShowText + ' delegation=' + okDelegation +
+            ' addMessage=' + okAddMessage + '); will retry');
+        }
+      }
+
+      tryInstall();
+
+      if (!window.__rendererFix.installed) {
+        var retryDelaysMs = [500, 1500, 3000, 6000, 10000];
+        for (var r = 0; r < retryDelaysMs.length; r++) {
+          (function (delay) {
+            setTimeout(function () {
+              if (!window.__rendererFix.installed) tryInstall();
+            }, delay);
+          })(retryDelaysMs[r]);
+        }
+      }
+    })();
+""".trimIndent()
+
 private val SITE_TWEAKS_JS = """
     (function () {
         function killOverlays() {
@@ -1465,8 +2003,10 @@ fun SiteWebView(
                         // before the document exists at all. The script itself arms on
                         // DOMContentLoaded and is idempotent, so double-injection is safe.
                         view.evaluateJavascript(SITE_TWEAKS_JS, null)
+                        view.evaluateJavascript(RENDERER_FIX_JS, null)
                         for (delayMs in longArrayOf(2000, 10000)) {
                             view.postDelayed({ view.evaluateJavascript(SITE_TWEAKS_JS, null) }, delayMs)
+                            view.postDelayed({ view.evaluateJavascript(RENDERER_FIX_JS, null) }, delayMs)
                         }
                     }
 
@@ -1481,6 +2021,7 @@ fun SiteWebView(
                             view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
                         }
                         view.evaluateJavascript(SITE_TWEAKS_JS, null)
+                        view.evaluateJavascript(RENDERER_FIX_JS, null)
                         canGoBack = view.canGoBack()
                     }
                 }
