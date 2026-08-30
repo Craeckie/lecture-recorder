@@ -1040,7 +1040,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Diagnostics first, so the device inventory is logged before any routing decision.
-        micDiagnostics = MicDiagnostics(this, ::setKeepScreenOn)
+        micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged)
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
@@ -1076,6 +1076,8 @@ class MainActivity : ComponentActivity() {
                         SiteWebView(
                             onAudioPermissionRequest = ::handleWebAudioPermission,
                             micBridge = micBridge,
+                            captureActive = captureActive,
+                            onExitApp = ::finish,
                         )
                         CaptureModeSelector(
                             modifier = Modifier.align(Alignment.BottomStart),
@@ -1086,6 +1088,17 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    // Mirrors MicDiagnostics' capture signal into Compose, so the back handler can ask
+    // before throwing away a live recording. This is the shell's ONLY knowledge that the
+    // page is recording -- the site never tells us -- so it drives both the screen flag
+    // and the confirmation.
+    private var captureActive by mutableStateOf(false)
+
+    private fun onCaptureActiveChanged(active: Boolean) {
+        captureActive = active
+        setKeepScreenOn(active)
     }
 
     // A screen that sleeps mid-lecture kills the recording twice over, and silently: the
@@ -1224,15 +1237,53 @@ fun SiteWebView(
     modifier: Modifier = Modifier,
     onAudioPermissionRequest: (PermissionRequest) -> Unit,
     micBridge: MicBridge,
+    captureActive: Boolean = false,
+    onExitApp: () -> Unit = {},
 ) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
     // into a State explicitly (updated on every navigation) for BackHandler to react
     // to in-page navigation instead of latching to the value from first composition.
     var canGoBack by remember { mutableStateOf(false) }
+    var confirmingLeave by remember { mutableStateOf(false) }
 
-    BackHandler(enabled = canGoBack) {
-        webView?.goBack()
+    // Leaving the recording page is destructive and irreversible: the site POSTs
+    // /delete_session/<id> as the page unloads, so the session and its transcript are gone
+    // -- no history entry brings them back. Both back paths do it, which is why this
+    // intercepts BOTH: goBack() when there is history, and finishing the activity when
+    // there is not (the default when BackHandler is disabled).
+    fun leave() {
+        if (canGoBack) webView?.goBack() else onExitApp()
+    }
+
+    // Enabled whenever back would do something destructive OR navigable. While capture is
+    // live it always asks first; otherwise back keeps walking the WebView history exactly
+    // as before, and falls through to the system when there is none.
+    BackHandler(enabled = captureActive || canGoBack) {
+        if (captureActive) confirmingLeave = true else leave()
+    }
+
+    if (confirmingLeave) {
+        AlertDialog(
+            onDismissRequest = { confirmingLeave = false },
+            title = { Text("Recording in progress") },
+            text = {
+                Text(
+                    "Leaving this page ends the session on the server and discards the "
+                        + "transcript. Stop the recording first if you want to keep it."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmingLeave = false
+                    Log.i(LOG_TAG, "Leaving a live recording, confirmed by the user")
+                    leave()
+                }) { Text("Discard and leave") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmingLeave = false }) { Text("Keep recording") }
+            },
+        )
     }
 
     AndroidView(

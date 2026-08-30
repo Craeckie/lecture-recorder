@@ -20,8 +20,19 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.App">
 
+        <!-- configChanges is load-bearing for recording, not a performance tweak.
+             Without it, rotating the phone destroys and recreates the activity, which
+             rebuilds the WebView and reloads the page - and the site deletes the
+             recording session on unload (POST /delete_session/<id>). One rotation
+             mid-lecture would silently end the recording.
+
+             uiMode is deliberately ABSENT: day/night is decided fresh per WebView
+             instance from isNightMode(), which only works because a system theme change
+             still restarts the activity. See CLAUDE.md pitfall #8. Do not add it here to
+             "be consistent" with the rest of this list. -->
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
             android:exported="true"
             android:theme="@style/Theme.App">
             <intent-filter>
