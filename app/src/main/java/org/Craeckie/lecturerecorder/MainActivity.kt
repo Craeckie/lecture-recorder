@@ -5,6 +5,7 @@ import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Bitmap
@@ -943,6 +944,7 @@ private fun isNightMode(context: Context): Boolean =
 class MainActivity : ComponentActivity() {
     private lateinit var micRouter: MicRouter
     private lateinit var micDiagnostics: MicDiagnostics
+    private lateinit var micBridge: MicBridge
 
     // Held while the OS permission dialog is up, so the page's own permission request can
     // be answered once the user has decided. Null at all other times.
@@ -969,6 +971,21 @@ class MainActivity : ComponentActivity() {
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
+        // Debug builds only. `adb shell am start -n org.Craeckie.lecturerecorder/.MainActivity
+        // --es micmode voice` pins the capture mode for the A/B/C probe in Task 4 of
+        // docs/superpowers/plans/2026-08-30-capture-mode-resolution.md. Release builds
+        // ignore it: MainActivity is an exported launcher activity, so another app must not
+        // be able to choose this app's audio mode.
+        val forcedMicMode =
+            if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                intent?.getStringExtra("micmode")
+            } else {
+                null
+            }
+        if (forcedMicMode != null) {
+            Log.i(LOG_TAG, "Capture mode forced to '$forcedMicMode' by intent extra")
+        }
+        micBridge = MicBridge(micRouter, forcedMicMode)
         // Asked before the page loads, so the OS dialog doesn't land on top of the site's
         // own recording UI mid-lecture.
         if (!hasMicPermission()) {
@@ -980,6 +997,7 @@ class MainActivity : ComponentActivity() {
                     SiteWebView(
                         modifier = Modifier.padding(innerPadding),
                         onAudioPermissionRequest = ::handleWebAudioPermission,
+                        micBridge = micBridge,
                     )
                 }
             }
@@ -1042,6 +1060,7 @@ class MainActivity : ComponentActivity() {
 fun SiteWebView(
     modifier: Modifier = Modifier,
     onAudioPermissionRequest: (PermissionRequest) -> Unit,
+    micBridge: MicBridge,
 ) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
@@ -1080,6 +1099,10 @@ fun SiteWebView(
                 // uploaded, an empty transcript and no error anywhere in the page.
                 // PERF_TRACE_JS's ctx= field reports the state this actually produces.
                 settings.mediaPlaybackRequiresUserGesture = false
+                // The page's getUserMedia patch pulls the capture mode from here at call
+                // time. One no-argument method returning one of three fixed strings --
+                // see MicBridge for why the surface is this small.
+                addJavascriptInterface(micBridge, "AndroidMic")
                 // Lets the live page be inspected via chrome://inspect#devices on a
                 // connected computer, e.g. to diagnose page-injection issues.
                 val isDebuggable =
