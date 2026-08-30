@@ -718,7 +718,8 @@ private val SITE_TWEAKS_JS = """
         //
         //   ec:true                     -> VOICE_COMMUNICATION, which
         //                                  AudioManager.setCommunicationDevice governs, so
-        //                                  MicRouter's USB selection applies
+        //                                  MicRouter's USB selection applies. ns/agc detach
+        //                                  independently, which is what 'hybrid' exploits.
         //   ec:false ns:false agc:false -> an unprocessed source; measured on a Pixel 9a
         //                                  this is CAMCORDER, pinned to a built-in mic
         //                                  array, which ignores setCommunicationDevice
@@ -774,11 +775,12 @@ private val SITE_TWEAKS_JS = """
                         audio.noiseSuppression = false;
                         audio.autoGainControl = false;
                     } else if (mode === 'hybrid') {
-                        // The bet: echoCancellation is what selects the source, while
+                        // echoCancellation is what selects the source, while
                         // noiseSuppression and autoGainControl only control effect
-                        // instances attached to the session. If that holds, this is USB
-                        // routing WITHOUT the noise suppression and AGC that ruin a
-                        // lecture recording. Task 4 measures whether it holds.
+                        // instances attached to the session -- measured on a Pixel 9a
+                        // with the KM_B2 on 2026-08-30. So this is USB routing WITHOUT
+                        // the noise suppression and AGC that ruin a lecture recording,
+                        // and it is the automatic default when a USB device is routed.
                         audio.echoCancellation = true;
                         audio.noiseSuppression = false;
                         audio.autoGainControl = false;
@@ -1210,7 +1212,7 @@ fun CaptureModeSelector(
 // trade-off (USB routing vs. the voice-call DSP that ruins a lecture recording) is the
 // entire reason this control exists.
 private val CAPTURE_MODE_CHOICES: List<Pair<String?, String>> = listOf(
-    null to "Automatic — USB attached: voice, otherwise raw",
+    null to "Automatic — USB attached: hybrid, otherwise raw",
     CaptureModes.RAW to "raw — no DSP, built-in mic only",
     CaptureModes.VOICE to "voice — USB routing, voice-call DSP",
     CaptureModes.HYBRID to "hybrid — USB routing, no NS/AGC",

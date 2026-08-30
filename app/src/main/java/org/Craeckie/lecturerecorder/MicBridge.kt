@@ -34,9 +34,13 @@ object CaptureModes {
 
     // `forced` is the manual override — the in-app selector, or the debug-only `micmode`
     // intent extra that writes through it. Null means "let the routing decide".
+    // HYBRID, not VOICE, when a USB device is routed: the 2026-08-30 device probe
+    // (Pixel 9a + KM_B2) showed echoCancellation alone selects VOICE_COMMUNICATION, so
+    // hybrid reaches the USB mic while noiseSuppression and autoGainControl stay off.
+    // The spec's "Measured ... KM_B2 attached" table has the logcat this reads off.
     fun resolve(forced: String?, usbSelected: Boolean): String {
         sanitize(forced)?.let { return it }
-        return if (usbSelected) VOICE else RAW
+        return if (usbSelected) HYBRID else RAW
     }
 }
 

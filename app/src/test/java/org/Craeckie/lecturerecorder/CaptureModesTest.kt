@@ -12,7 +12,9 @@ class CaptureModesTest {
 
     @Test
     fun `a usb device means the routed mode`() {
-        assertEquals(CaptureModes.VOICE, CaptureModes.resolve(forced = null, usbSelected = true))
+        // hybrid, not voice: the 2026-08-30 device probe showed it reaches the USB mic
+        // without the voice DSP. See the spec's "Measured ... KM_B2 attached" table.
+        assertEquals(CaptureModes.HYBRID, CaptureModes.resolve(forced = null, usbSelected = true))
     }
 
     @Test
@@ -26,7 +28,7 @@ class CaptureModesTest {
     fun `an unrecognised forced mode falls back to the automatic rule`() {
         // A typo on the adb command line must not silently disable capture tuning.
         assertEquals(CaptureModes.RAW, CaptureModes.resolve(forced = "vioce", usbSelected = false))
-        assertEquals(CaptureModes.VOICE, CaptureModes.resolve(forced = "", usbSelected = true))
+        assertEquals(CaptureModes.HYBRID, CaptureModes.resolve(forced = "", usbSelected = true))
     }
 
     @Test
