@@ -1,7 +1,9 @@
 package org.Craeckie.lecturerecorder
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 // AudioDeviceInfo type constants, spelled out so this test runs on a bare JVM.
@@ -46,5 +48,18 @@ class MicRoutingTest {
     @Test
     fun `usb communication types are exactly the three usb constants`() {
         assertEquals(setOf(TYPE_USB_DEVICE, TYPE_USB_ACCESSORY, TYPE_USB_HEADSET), MicRouting.USB_COMMUNICATION_TYPES)
+    }
+
+    @Test
+    fun `usb communication types are recognised`() {
+        assertTrue(MicRouting.isUsbCommunicationType(TYPE_USB_DEVICE))
+        assertTrue(MicRouting.isUsbCommunicationType(TYPE_USB_HEADSET))
+        assertTrue(MicRouting.isUsbCommunicationType(TYPE_USB_ACCESSORY))
+    }
+
+    @Test
+    fun `non-usb communication types are rejected`() {
+        assertFalse(MicRouting.isUsbCommunicationType(TYPE_BUILTIN_MIC))
+        assertFalse(MicRouting.isUsbCommunicationType(TYPE_BLUETOOTH_SCO))
     }
 }

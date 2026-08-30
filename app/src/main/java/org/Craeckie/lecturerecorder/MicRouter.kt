@@ -30,6 +30,8 @@ object MicRouting {
         AudioDeviceInfo.TYPE_USB_HEADSET,
     )
 
+    fun isUsbCommunicationType(type: Int): Boolean = type in USB_COMMUNICATION_TYPES
+
     // Index of the first USB communication device in the given device-type list, or null if
     // there is none. First-wins rather than a priority order: the platform lists devices in
     // connection order, and with two USB mics attached there is no principled way to prefer
@@ -72,6 +74,19 @@ class MicRouter(context: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.clearCommunicationDevice()
         }
+    }
+
+    // Whether capture routed to the communication path would currently land on a USB
+    // device. Reads the platform's CURRENT communication device rather than what
+    // applyRouting() last decided, so it stays truthful if the system, a phone call or
+    // another app changed the route behind us. Safe to call from any thread.
+    //
+    // This is the single bit MicBridge hands to the page, and it is why the page's
+    // capture-mode decision is made at getUserMedia time rather than at page load.
+    fun usbCommunicationDeviceSelected(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+        val device = audioManager.communicationDevice ?: return false
+        return MicRouting.isUsbCommunicationType(device.type)
     }
 
     // Only ever constructed from inside the SDK_INT >= S branch of attach(), but its
