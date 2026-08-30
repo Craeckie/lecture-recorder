@@ -696,36 +696,89 @@ private val SITE_TWEAKS_JS = """
             document.head.appendChild(st);
             new MutationObserver(killOverlays).observe(document.body, { childList: true });
         }
-        // The site calls getUserMedia with the default echoCancellation: true, which sends
-        // Chromium to the VOICE_COMMUNICATION audio source -- the platform's voice-call
-        // DSP (AEC + noise suppression + AGC), tuned for a handset held at your mouth in a
-        // two-way call. For a lecturer several metres from the phone, the noise
-        // suppression treats the speech as background and the AGC pumps the noise floor
-        // between phrases, which is poor input for transcription. Forcing the three
-        // constraints off moves capture to the plain MIC source instead.
+        // Chromium picks the Android AudioSource from the processing constraints, so
+        // "which microphone" and "which DSP" are the same knob:
         //
-        // Confirm from logcat: "Recording active: source=MIC" replaces
-        // source=VOICE_COMMUNICATION. MicDiagnostics then warns that USB routing does not
-        // apply, which is the EXPECTED result here -- see the tradeoff in CLAUDE.md.
-        function forceRawAudioCapture() {
-            if (window.__appRawAudio) return;
+        //   ec:true                     -> VOICE_COMMUNICATION, which
+        //                                  AudioManager.setCommunicationDevice governs, so
+        //                                  MicRouter's USB selection applies
+        //   ec:false ns:false agc:false -> an unprocessed source; measured on a Pixel 9a
+        //                                  this is CAMCORDER, pinned to a built-in mic
+        //                                  array, which ignores setCommunicationDevice
+        //
+        // Only the shell knows which side of that trade is right, because only the shell
+        // knows what is plugged in -- hence the AndroidMic bridge (see MicBridge.kt). The
+        // mode is pulled inside the wrapper rather than read once at arm time, so it
+        // reflects the routing at the moment recording actually starts.
+        //
+        // Outside the app -- the Playwright harnesses in tools/, a desktop browser --
+        // window.AndroidMic does not exist and the mode falls back to 'raw', which is what
+        // those harnesses assert.
+        //
+        // Confirm from logcat which mode was applied, and what the platform then did:
+        //   [app-tweaks] capture mode=voice ec=true ns=undefined agc=undefined
+        //   Recording active: source=VOICE_COMMUNICATION via USB-Audio - KM_B2 ...
+        function shellCaptureMode() {
+            try {
+                if (window.AndroidMic && window.AndroidMic.captureMode) {
+                    var m = String(window.AndroidMic.captureMode());
+                    // The three literals CaptureModes.ALL holds. They cross a language
+                    // boundary, so they cannot share a constant -- CaptureModesTest
+                    // asserts the Kotlin side still matches these.
+                    if (m === 'raw' || m === 'voice' || m === 'hybrid') return m;
+                }
+            } catch (e) {
+                // Bridge absent (a desktop browser) or threw; fall through to raw.
+            }
+            return 'raw';
+        }
+
+        function applyCaptureMode() {
+            if (window.__appCapturePatched) return;
             var md = navigator.mediaDevices;
             if (!md || !md.getUserMedia) return;
-            window.__appRawAudio = true;
+            window.__appCapturePatched = true;
             var orig = md.getUserMedia.bind(md);
             md.getUserMedia = function (constraints) {
                 // Copy rather than mutate: the page may reuse its constraints object, and
                 // handing back a modified one is a surprise it never asked for.
+                //
+                // The site passes { audio: true, video: false, echoCancellation: false } --
+                // echoCancellation at the TOP level, where the browser ignores it. So the
+                // site's own attempt at raw capture has never done anything, and `audio`
+                // arrives as a boolean that has to be normalised to an object first.
                 if (constraints && constraints.audio) {
+                    var mode = shellCaptureMode();
                     var audio = (typeof constraints.audio === 'object')
                         ? Object.assign({}, constraints.audio)
                         : {};
-                    audio.echoCancellation = false;
-                    audio.noiseSuppression = false;
-                    audio.autoGainControl = false;
+                    if (mode === 'raw') {
+                        audio.echoCancellation = false;
+                        audio.noiseSuppression = false;
+                        audio.autoGainControl = false;
+                    } else if (mode === 'hybrid') {
+                        // The bet: echoCancellation is what selects the source, while
+                        // noiseSuppression and autoGainControl only control effect
+                        // instances attached to the session. If that holds, this is USB
+                        // routing WITHOUT the noise suppression and AGC that ruin a
+                        // lecture recording. Task 4 measures whether it holds.
+                        audio.echoCancellation = true;
+                        audio.noiseSuppression = false;
+                        audio.autoGainControl = false;
+                    } else {
+                        // voice: ask for the communication path and leave the platform's
+                        // voice DSP alone. Deliberately delete rather than set false --
+                        // the page must not inherit a stale value from its own object.
+                        audio.echoCancellation = true;
+                        delete audio.noiseSuppression;
+                        delete audio.autoGainControl;
+                    }
                     constraints = Object.assign({}, constraints);
                     constraints.audio = audio;
-                    console.log('[app-tweaks] forcing raw audio capture (no AEC/NS/AGC)');
+                    console.log('[app-tweaks] capture mode=' + mode
+                        + ' ec=' + audio.echoCancellation
+                        + ' ns=' + audio.noiseSuppression
+                        + ' agc=' + audio.autoGainControl);
                 }
                 return orig(constraints);
             };
@@ -898,7 +951,7 @@ private val SITE_TWEAKS_JS = """
                 shortCircuitResampler,
                 'waveResampler');
         }
-        forceRawAudioCapture();
+        applyCaptureMode();
         killOverlays();
         // Arm on DOMContentLoaded rather than relying on a later injection: the WebView's
         // onPageFinished tracks the window 'load' event, which ad/consent scripts can
