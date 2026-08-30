@@ -26,11 +26,16 @@ object CaptureModes {
 
     val ALL: Set<String> = setOf(RAW, VOICE, HYBRID)
 
-    // `forced` comes from the debug-only `micmode` intent extra. Anything unrecognised is
-    // ignored rather than trusted: a typo on the adb command line should fall back to the
-    // automatic rule, not put capture into an undefined state.
+    // The one place an outside string becomes a mode. Anything unrecognised is ignored
+    // rather than trusted: a typo on the adb command line, or a stale value left in the
+    // preferences by an older build, should fall back to the automatic rule rather than
+    // put capture into an undefined state.
+    fun sanitize(value: String?): String? = if (value != null && value in ALL) value else null
+
+    // `forced` is the manual override — the in-app selector, or the debug-only `micmode`
+    // intent extra that writes through it. Null means "let the routing decide".
     fun resolve(forced: String?, usbSelected: Boolean): String {
-        if (forced != null && forced in ALL) return forced
+        sanitize(forced)?.let { return it }
         return if (usbSelected) VOICE else RAW
     }
 }
@@ -46,17 +51,22 @@ object CaptureModes {
 // rather than whatever was true when the page loaded. Called on the WebView's JS bridge
 // thread, not the main thread -- which is fine, AudioManager.getCommunicationDevice() has
 // no thread affinity.
+//
+// `forcedMode` is a supplier, not a value, for the same reason: the in-app selector can
+// change the override between two recordings without the page being reloaded, and the
+// next getUserMedia has to see the new choice.
 class MicBridge(
     private val router: MicRouter,
-    private val forcedMode: String?,
+    private val forcedMode: () -> String?,
 ) {
     @JavascriptInterface
     fun captureMode(): String {
         val usb = router.usbCommunicationDeviceSelected()
-        val mode = CaptureModes.resolve(forcedMode, usb)
+        val forced = forcedMode()
+        val mode = CaptureModes.resolve(forced, usb)
         Log.i(
             LOG_TAG,
-            "Page asked for capture mode -> $mode (usbSelected=$usb, forced=${forcedMode ?: "none"})",
+            "Page asked for capture mode -> $mode (usbSelected=$usb, forced=${forced ?: "none"})",
         )
         return mode
     }

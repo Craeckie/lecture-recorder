@@ -27,15 +27,32 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import org.Craeckie.lecturerecorder.ui.theme.AppTheme
 
@@ -998,6 +1015,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var micRouter: MicRouter
     private lateinit var micDiagnostics: MicDiagnostics
     private lateinit var micBridge: MicBridge
+    private lateinit var captureModePreference: CaptureModePreference
 
     // Held while the OS permission dialog is up, so the page's own permission request can
     // be answered once the user has decided. Null at all other times.
@@ -1024,21 +1042,26 @@ class MainActivity : ComponentActivity() {
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
+        captureModePreference = CaptureModePreference(this)
         // Debug builds only. `adb shell am start -n org.Craeckie.lecturerecorder/.MainActivity
         // --es micmode voice` pins the capture mode for the A/B/C probe in Task 4 of
         // docs/superpowers/plans/2026-08-30-capture-mode-resolution.md. Release builds
         // ignore it: MainActivity is an exported launcher activity, so another app must not
         // be able to choose this app's audio mode.
-        val forcedMicMode =
-            if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-                intent?.getStringExtra("micmode")
-            } else {
-                null
+        //
+        // The extra writes THROUGH the preference rather than around it, so there is a
+        // single source of truth: the in-app selector then shows what adb asked for, and
+        // the choice survives the next launch the same way a tapped one does.
+        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            val extra = CaptureModes.sanitize(intent?.getStringExtra("micmode"))
+            if (extra != null) {
+                Log.i(LOG_TAG, "Capture mode forced to '$extra' by intent extra")
+                captureModePreference.override = extra
             }
-        if (forcedMicMode != null) {
-            Log.i(LOG_TAG, "Capture mode forced to '$forcedMicMode' by intent extra")
         }
-        micBridge = MicBridge(micRouter, forcedMicMode)
+        // A supplier, not a value: the selector can change this between recordings without
+        // the page reloading, and the next getUserMedia must see the new choice.
+        micBridge = MicBridge(micRouter) { captureModePreference.override }
         // Asked before the page loads, so the OS dialog doesn't land on top of the site's
         // own recording UI mid-lecture.
         if (!hasMicPermission()) {
@@ -1047,11 +1070,17 @@ class MainActivity : ComponentActivity() {
         setContent {
             AppTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    SiteWebView(
-                        modifier = Modifier.padding(innerPadding),
-                        onAudioPermissionRequest = ::handleWebAudioPermission,
-                        micBridge = micBridge,
-                    )
+                    Box(modifier = Modifier.padding(innerPadding)) {
+                        SiteWebView(
+                            onAudioPermissionRequest = ::handleWebAudioPermission,
+                            micBridge = micBridge,
+                        )
+                        CaptureModeSelector(
+                            modifier = Modifier.align(Alignment.BottomStart),
+                            initialOverride = captureModePreference.override,
+                            onOverrideChange = { captureModePreference.override = it },
+                        )
+                    }
                 }
             }
         }
@@ -1107,6 +1136,85 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 }
+
+// The in-app capture-mode override: a deliberately tiny, mostly transparent chip in the
+// bottom-left corner that opens a four-way picker.
+//
+// It sits ON TOP of the wrapped site, so it is sized and faded to be ignorable — the site
+// owns the screen and this is a diagnostic control, not app chrome. The bottom-left corner
+// is the one the site leaves empty; if that ever changes, move the chip rather than growing
+// it.
+//
+// "Automatic" is the normal setting. The three named modes exist because which one actually
+// reaches an attached USB microphone is an empirical question — see CaptureModePreference
+// and the probe plan. Changing the mode takes effect on the NEXT recording, since the page
+// only reads the bridge inside getUserMedia; it does not disturb a recording in progress.
+@Composable
+fun CaptureModeSelector(
+    modifier: Modifier = Modifier,
+    initialOverride: String?,
+    onOverrideChange: (String?) -> Unit,
+) {
+    var override by remember { mutableStateOf(initialOverride) }
+    var picking by remember { mutableStateOf(false) }
+
+    Text(
+        text = override?.uppercase() ?: "AUTO",
+        fontSize = 9.sp,
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = modifier
+            .padding(4.dp)
+            .alpha(0.35f)
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(4.dp),
+            )
+            .clickable { picking = true }
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+    )
+
+    if (!picking) return
+    AlertDialog(
+        onDismissRequest = { picking = false },
+        title = { Text("Microphone capture mode") },
+        text = {
+            Column {
+                CAPTURE_MODE_CHOICES.forEach { (value, label) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .selectable(
+                                selected = override == value,
+                                onClick = {
+                                    override = value
+                                    onOverrideChange(value)
+                                    picking = false
+                                },
+                            )
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = override == value, onClick = null)
+                        Text(text = label, modifier = Modifier.padding(start = 8.dp))
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { picking = false }) { Text("Close") }
+        },
+    )
+}
+
+// Ordered as the picker shows them. The labels say what each mode costs, because the
+// trade-off (USB routing vs. the voice-call DSP that ruins a lecture recording) is the
+// entire reason this control exists.
+private val CAPTURE_MODE_CHOICES: List<Pair<String?, String>> = listOf(
+    null to "Automatic — USB attached: voice, otherwise raw",
+    CaptureModes.RAW to "raw — no DSP, built-in mic only",
+    CaptureModes.VOICE to "voice — USB routing, voice-call DSP",
+    CaptureModes.HYBRID to "hybrid — USB routing, no NS/AGC",
+)
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable

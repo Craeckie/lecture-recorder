@@ -1,6 +1,7 @@
 package org.Craeckie.lecturerecorder
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 class CaptureModesTest {
@@ -34,5 +35,18 @@ class CaptureModesTest {
         // bridge value crosses a language boundary and cannot share a constant. If this
         // set changes, that function changes with it.
         assertEquals(setOf("raw", "voice", "hybrid"), CaptureModes.ALL)
+    }
+
+    @Test
+    fun `sanitize keeps a known mode and rejects everything else`() {
+        // The in-app selector and the intent extra both write through sanitize, so a
+        // stale or hand-edited preference value can never reach resolve().
+        assertEquals(CaptureModes.RAW, CaptureModes.sanitize("raw"))
+        assertEquals(CaptureModes.VOICE, CaptureModes.sanitize("voice"))
+        assertEquals(CaptureModes.HYBRID, CaptureModes.sanitize("hybrid"))
+        assertNull(CaptureModes.sanitize(null))
+        assertNull(CaptureModes.sanitize(""))
+        assertNull(CaptureModes.sanitize("Raw"))
+        assertNull(CaptureModes.sanitize("vioce"))
     }
 }

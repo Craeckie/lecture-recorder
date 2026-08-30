@@ -37,7 +37,7 @@ object MicRouting {
     // connection order, and with two USB mics attached there is no principled way to prefer
     // one.
     fun pickPreferredDeviceIndex(deviceTypes: List<Int>): Int? =
-        deviceTypes.indexOfFirst { it in USB_COMMUNICATION_TYPES }.takeIf { it >= 0 }
+        deviceTypes.indexOfFirst { isUsbCommunicationType(it) }.takeIf { it >= 0 }
 }
 
 // Routes microphone capture to an attached USB input, so the wrapped page's getUserMedia
