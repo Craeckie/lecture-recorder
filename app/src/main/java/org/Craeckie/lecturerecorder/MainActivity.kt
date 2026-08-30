@@ -29,6 +29,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -44,9 +45,11 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -92,6 +95,17 @@ private val ENABLE_DARKREADER_JS = """
     })();
 """.trimIndent()
 
+// The other half of the switch: the system theme can change mid-recording, and the
+// activity no longer restarts when it does (uiMode is in android:configChanges, because a
+// restart would reload the page and delete the recording session). So a page that was
+// loaded in night mode has to be un-darkened in place. Idempotent, and safe on a page
+// where the bundle was never injected at all.
+private val DISABLE_DARKREADER_JS = """
+    (function () {
+        if (window.DarkReader && DarkReader.isEnabled()) { DarkReader.disable(); }
+    })();
+""".trimIndent()
+
 private fun injectDarkReaderJs(bundle: String): String = """
     (function() {
         if (!window.DarkReader) {
@@ -99,6 +113,23 @@ private fun injectDarkReaderJs(bundle: String): String = """
         }
     })();
 """.trimIndent()
+
+// The ~346KB bundle, read from assets at most once per process. Day/night is now a live
+// switch rather than a per-WebView constant, so this can be asked for at any moment --
+// including in the middle of a lecture, where hitting the disk again would be a pointless
+// main-thread stall. Main-thread only, hence no synchronization.
+private var darkReaderBundle: String? = null
+
+private fun darkReaderInjectJs(context: Context): String {
+    val bundle = darkReaderBundle
+        ?: context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+            .also { darkReaderBundle = it }
+    return injectDarkReaderJs(bundle)
+}
+
+// The WebView's own surface color, so there is no white flash before the page paints.
+private const val DARK_SURFACE = "#111111"
+private const val LIGHT_SURFACE = "#FFFFFF"
 
 // Per-site tweaks injected on every load: hide elements, kill consent overlays, pin
 // layout. Everything must be IDEMPOTENT (guarded by window.__appTweaks) because it is
@@ -1006,9 +1037,10 @@ private fun errorPageHtml(isDark: Boolean, reason: String): String {
     """.trimIndent()
 }
 
-// Whether the system is currently in night mode, read live off the WebView's context so
-// it reflects the setting at the time of each page load (the activity restarts on a
-// system theme change, since uiMode isn't declared in android:configChanges).
+// Whether the system is currently in night mode, read live off the WebView's context.
+// Used for one-shot decisions (the error page's background); the WebView's own day/night
+// state follows isSystemInDarkTheme() instead, which recomposes when the theme changes
+// without the activity restarting.
 private fun isNightMode(context: Context): Boolean =
     (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
         Configuration.UI_MODE_NIGHT_YES
@@ -1141,6 +1173,16 @@ class MainActivity : ComponentActivity() {
             pendingWebPermission = request
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    // The activity now handles uiMode itself instead of being recreated (a restart would
+    // reload the page and delete the recording session). Compose picks the new theme up on
+    // its own, and SiteWebView switches Dark Reader in place -- but the edge-to-edge system
+    // bar styling was decided once in onCreate from the configuration at that moment, so it
+    // has to be re-decided here or the status/navigation bar icons keep the old contrast.
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        enableEdgeToEdge()
     }
 
     // Deliberately onDestroy and not onPause: the routing has to survive the screen going
@@ -1286,6 +1328,27 @@ fun SiteWebView(
         )
     }
 
+    // Day/night is LIVE state, not a per-WebView constant: uiMode is in
+    // android:configChanges (a restart would reload the page and delete the recording
+    // session), so a theme change now arrives here as a recomposition and has to be
+    // applied to the page that is already loaded.
+    val isDark = isSystemInDarkTheme()
+    // Read inside the WebViewClient callbacks, which outlive this composition and must see
+    // the CURRENT theme on every navigation, not the one from the factory call.
+    val darkState = rememberUpdatedState(isDark)
+
+    LaunchedEffect(webView, isDark) {
+        val view = webView ?: return@LaunchedEffect
+        view.setBackgroundColor(Color.parseColor(if (isDark) DARK_SURFACE else LIGHT_SURFACE))
+        if (isDark) {
+            view.evaluateJavascript(darkReaderInjectJs(view.context), null)
+            view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+        } else {
+            view.evaluateJavascript(DISABLE_DARKREADER_JS, null)
+        }
+        Log.i(LOG_TAG, "Night mode=$isDark applied in place (no reload)")
+    }
+
     AndroidView(
         modifier = modifier.fillMaxSize(),
         factory = { context ->
@@ -1340,19 +1403,10 @@ fun SiteWebView(
                         onAudioPermissionRequest(request)
                     }
                 }
-                val isDark = isNightMode(context)
-                // Loaded once per WebView instance rather than per navigation.
-                val darkReaderInjectJs = if (isDark) {
-                    val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
-                    injectDarkReaderJs(bundle)
-                } else {
-                    null
-                }
-                if (isDark) {
-                    // Avoids a white flash of the WebView's own surface before the page
-                    // has painted and Dark Reader has kicked in.
-                    setBackgroundColor(Color.parseColor("#111111"))
-                }
+                // Avoids a white flash of the WebView's own surface before the page has
+                // painted and Dark Reader has kicked in. Re-asserted by the theme effect
+                // above whenever the system theme changes.
+                if (darkState.value) setBackgroundColor(Color.parseColor(DARK_SURFACE))
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                         view: WebView,
@@ -1401,8 +1455,8 @@ fun SiteWebView(
                             view.postDelayed({ view.evaluateJavascript(NET_TRACE_JS, null) }, 2000)
                             view.postDelayed({ view.evaluateJavascript(PERF_TRACE_JS, null) }, 2000)
                         }
-                        if (darkReaderInjectJs != null) {
-                            view.evaluateJavascript(darkReaderInjectJs, null)
+                        if (darkState.value) {
+                            view.evaluateJavascript(darkReaderInjectJs(view.context), null)
                             view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
                         }
                         // Inject early and re-post on timers (scheduled here, NOT in
@@ -1418,12 +1472,12 @@ fun SiteWebView(
 
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
-                        if (darkReaderInjectJs != null) {
+                        if (darkState.value) {
                             // Re-asserted after load in case late page scripts touched
                             // <head> after our first injection. The "if (!window.DarkReader)"
                             // guard keeps this from re-parsing the ~346KB bundle a second
                             // time within the same document.
-                            view.evaluateJavascript(darkReaderInjectJs, null)
+                            view.evaluateJavascript(darkReaderInjectJs(view.context), null)
                             view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
                         }
                         view.evaluateJavascript(SITE_TWEAKS_JS, null)

@@ -26,13 +26,15 @@
              recording session on unload (POST /delete_session/<id>). One rotation
              mid-lecture would silently end the recording.
 
-             uiMode is deliberately ABSENT: day/night is decided fresh per WebView
-             instance from isNightMode(), which only works because a system theme change
-             still restarts the activity. See CLAUDE.md pitfall #8. Do not add it here to
-             "be consistent" with the rest of this list. -->
+             uiMode is in the list for exactly the same reason, and it used to be
+             absent: day/night was decided once per WebView instance, which only worked
+             because a system theme change restarted the activity - and that restart
+             ended a live recording just as surely as a rotation did. Day/night is now
+             switched in place instead (see the isSystemInDarkTheme() effect in
+             SiteWebView), so nothing here may reload the page. -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
+            android:configChanges="uiMode|orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation"
             android:exported="true"
             android:theme="@style/Theme.App">
             <intent-filter>
