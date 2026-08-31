@@ -1523,11 +1523,304 @@ private val SITE_TWEAKS_JS = """
             console.log('[app-tweaks] waveResampler.resample short-circuited for equal rates');
         }
 
+        // The site issues SYNCHRONOUS XMLHttpRequests -- request.open(..., false) -- from
+        // five call sites (present/index.html:2947, 2993, 3021, 5857, 5887). Each freezes
+        // the main thread for a full round trip: measured at ~90ms of SERVER time on good
+        // WiFi, plus 150-250ms RTT on this app's normal link. Page load serialized ~36 of
+        // them for 3.3s.
+        //
+        // Two of the three endpoints are immutable for the lifetime of a session -- they
+        // describe the pipeline topology and its language mapping, neither of which
+        // changes while a lecture runs -- so a repeat call can be answered from memory.
+        //
+        // /get_previous_messages is NOT one of them: it is range-dependent and carries
+        // lecture content. It is deliberately absent from this list and must stay absent.
+        var IMMUTABLE_SYNC_PATHS = ['/getgraph', '/get_output_language_component'];
+
+        function isImmutableSyncPath(url) {
+            var path = String(url).split('?')[0];
+            for (var i = 0; i < IMMUTABLE_SYNC_PATHS.length; i++) {
+                if (path.indexOf(IMMUTABLE_SYNC_PATHS[i]) >= 0) return true;
+            }
+            return false;
+        }
+
+        // A THIRD copy of redactIds -- NET_TRACE_JS:170 and PERF_TRACE_JS:357 have the
+        // other two, and :355 already documents why they are not shared. The reason for
+        // this one is different and stronger: both of those are injected in DEBUG builds
+        // only, while SITE_TWEAKS_JS ships in release. The session id is a long hex path
+        // SEGMENT, not a query param, so stripping query strings would not keep it out of
+        // a log export. Every path this patch logs goes through here.
+        function redactPath(url) {
+            var p;
+            try { p = new URL(String(url), location.href).pathname; }
+            catch (e) { p = String(url).split('?')[0]; }
+            return p.replace(/\/[0-9a-f]{20,}/gi, '/<id>');
+        }
+
+        // The prefetch writes into the same store the shim reads, so both MUST build the
+        // key the same way. Body included: get_output_language_component is one path
+        // serving many workers, discriminated only by its body.
+        function cacheKey(method, url, body) {
+            return String(method) + ' ' + String(url).split('?')[0]
+                + ' ' + (body == null ? '' : String(body));
+        }
+
+        function syncXhrCache() {
+            if (window.__appSyncXhrPatched) return;
+            window.__appSyncXhrPatched = true;
+            var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
+            var stats = window.__appSyncXhrStats = window.__appSyncXhrStats
+                || { hit: 0, miss: 0, stored: 0, passthrough: 0, refused: 0 };
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            var SHADOWED = ['readyState', 'status', 'responseText'];
+            // A lecture is an hour long, so per-call logging has to be bounded. HITs are
+            // sampled then counted; MISS and STORE are always logged because there is at
+            // most one of each per distinct key, and they are exactly the lines you need
+            // when the cache is not working. See the spec's "Noise control".
+            var HIT_LOG_CAP = 5;
+            // ~90ms of server time per avoided round trip, measured on device 2026-08-30
+            // on good WiFi. An estimate for the log line, not a measurement.
+            var SAVED_MS_EACH = 90;
+
+            XMLHttpRequest.prototype.open = function (method, url, async) {
+                // updateWindowContent (index.html:2988-3008) creates ONE XMLHttpRequest
+                // and reuses it across every worker in the graph. A previous cache hit
+                // left own data properties on this object shadowing the prototype
+                // accessors; if they survive into the next request, its real response is
+                // read through them. Clear them on every open().
+                for (var i = 0; i < SHADOWED.length; i++) {
+                    if (Object.prototype.hasOwnProperty.call(this, SHADOWED[i])) {
+                        delete this[SHADOWED[i]];
+                    }
+                }
+                this.__appSync = (async === false);
+                this.__appCacheable = this.__appSync && isImmutableSyncPath(url);
+                this.__appMethod = method;
+                this.__appUrl = url;
+                return origOpen.apply(this, arguments);
+            };
+
+            XMLHttpRequest.prototype.send = function (body) {
+                if (!this.__appCacheable) {
+                    // Every /get_previous_messages lands here. Counted, never logged
+                    // individually: there are hundreds an hour and their bodies and
+                    // responses are lecture content.
+                    if (this.__appSync) stats.passthrough++;
+                    return origSend.apply(this, arguments);
+                }
+                var key = cacheKey(this.__appMethod, this.__appUrl, body);
+                var shown = String(this.__appMethod) + ' ' + redactPath(this.__appUrl)
+                    + (body == null ? '' : ' body=' + String(body).slice(0, 80));
+                if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    // Own data properties shadow the prototype's accessors, so the
+                    // synchronous caller reads a complete 200 without a round trip.
+                    Object.defineProperty(this, 'readyState',
+                        { value: 4, configurable: true });
+                    Object.defineProperty(this, 'status',
+                        { value: 200, configurable: true });
+                    Object.defineProperty(this, 'responseText',
+                        { value: store[key], configurable: true });
+                    stats.hit++;
+                    if (stats.hit <= HIT_LOG_CAP) {
+                        console.log('[app-tweaks] sync-xhr HIT  ' + shown);
+                    }
+                    return;
+                }
+                var result = origSend.apply(this, arguments);
+                stats.miss++;
+                // Always logged, and it prints the exact key that was looked up. A MISS
+                // on an immutable path AFTER the prefetch reported keys stored is the
+                // signature of a key mismatch between the two sides -- the most likely
+                // bug in this patch -- and this line plus the STORE line below are what
+                // let you diff the two keys from logcat alone.
+                console.log('[app-tweaks] sync-xhr MISS ' + shown);
+                // Only a 200 is stored. A cached failure would be pinned for the whole
+                // lecture -- and getGraph() falls back to the internal ltapi:5000 host on
+                // non-200, which does not resolve off-site and hangs.
+                try {
+                    if (this.status === 200) {
+                        store[key] = this.responseText;
+                        stats.stored++;
+                        console.log('[app-tweaks] sync-xhr STORE ' + shown
+                            + ' (200, ' + String(this.responseText || '').length + 'B)');
+                    } else {
+                        stats.refused++;
+                        console.log('[app-tweaks] sync-xhr NOT CACHED ' + shown
+                            + ' (status ' + this.status + ')');
+                    }
+                } catch (e) {
+                    // A cross-origin or errored request can throw on responseText; a miss
+                    // that stores nothing is the correct outcome.
+                    stats.refused++;
+                    console.log('[app-tweaks] sync-xhr NOT CACHED ' + shown
+                        + ' (threw: ' + e + ')');
+                }
+                return result;
+            };
+
+            function summary(why) {
+                console.log('[app-tweaks] sync-xhr summary (' + why + '): hit=' + stats.hit
+                    + ' miss=' + stats.miss + ' stored=' + stats.stored
+                    + ' refused=' + stats.refused
+                    + ' passthrough=' + stats.passthrough
+                    + ' savedApprox=' + (stats.hit * SAVED_MS_EACH) + 'ms');
+            }
+            // One line after the load burst has settled, and one on the way out, so a
+            // logcat export taken at any point in a lecture has a total in it.
+            setTimeout(function () { summary('12s'); }, 12000);
+            window.addEventListener('pagehide', function () { summary('pagehide'); });
+
+            console.log('[app-tweaks] sync-xhr cache armed');
+        }
+
+        // The session id: window.sessionId is set in <head> (index.html:19,
+        // `window.sessionId = "2716...477"`), before any body script runs. Prefer it --
+        // it's exact and cheap. Fall back to scanning <script> text for a literal
+        // /webapi/<id>/ path (present on the vendored snapshot at index.html:415 etc.) for
+        // a page that never sets the global. Scan only <script> text, not the whole
+        // document, so the fallback stays cheap too.
+        function webapiBase() {
+            if (window.sessionId) return '/webapi/' + window.sessionId;
+            var scripts = document.getElementsByTagName('script');
+            for (var i = 0; i < scripts.length; i++) {
+                var m = (scripts[i].textContent || '')
+                    .match(/["']\/webapi\/([0-9a-zA-Z]{16,})\//);
+                if (m) return '/webapi/' + m[1];
+            }
+            return null;
+        }
+
+        // Warm the cache syncXhrCache() reads, before the page's synchronous calls run.
+        // Entirely best-effort: on any failure the page falls back to exactly today's
+        // behaviour, which is the same synchronous call it makes now.
+        //
+        // Uses fetch, not XHR, so these do not go through the shim's own wrapper and
+        // cannot recurse. Same-origin credentials are the fetch default, which is what the
+        // site's Dex session cookie needs -- do not "tidy" that to omit.
+        function prefetchImmutable() {
+            if (window.__appPrefetched) return;
+            var base = webapiBase();
+            if (!base) {
+                console.log('[app-tweaks] prefetch skipped: no session id yet');
+                return;
+            }
+            window.__appPrefetched = true;
+            var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
+            var t0 = performance.now();
+            var graphUrl = base + '/getgraph';
+            // redactPath() so the session id never reaches a log export, exactly as in
+            // syncXhrCache. This line is how you tell "the prefetch never ran" apart from
+            // "it ran against the wrong base path".
+            console.log('[app-tweaks] sync-xhr base=' + redactPath(base)
+                + ' from ' + (window.sessionId ? 'window.sessionId' : 'page scripts'));
+
+            function post(url, body, label, trackWin) {
+                // The page's own synchronous XHR for this same key can still win the
+                // race -- e.g. on a page whose sessionId assignment is caught only by
+                // the fallback poll below, or simply a slower network for THIS
+                // particular job. If it already stored a response, fetching again here
+                // would be a second, redundant hit to the network for an endpoint that
+                // is supposed to reach it AT MOST once. Read the store first and
+                // short-circuit on whatever is already there, success or not: this
+                // function only ever races the page's own cacheable calls, and those
+                // only store on a 200 (see syncXhrCache's STORE branch), so anything
+                // found here is already a good response.
+                var key = cacheKey('POST', url, body);
+                if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    console.log('[app-tweaks] prefetch ' + label
+                        + ' already cached (page won the race), skipping fetch');
+                    return Promise.resolve(store[key]);
+                }
+                if (trackWin) {
+                    // Recorded HERE, at the instant the store-check found nothing --
+                    // not after the fetch resolves. Winning the race this task exists
+                    // to win is about being FIRST TO ASK, not about resolving fastest;
+                    // tools/site-patches-test.mjs reads this flag to tell "the prefetch
+                    // actually reached the network ahead of the page" apart from "the
+                    // prefetch never got the chance to try".
+                    window.__appPrefetchWon = true;
+                }
+                var t = performance.now();
+                return fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+                    body: body
+                }).then(function (r) {
+                    if (r.status !== 200) throw new Error('HTTP ' + r.status);
+                    return r.text();
+                }).then(function (text) {
+                    store[cacheKey('POST', url, body)] = text;
+                    console.log('[app-tweaks] prefetch ' + label + ' ok in '
+                        + Math.round(performance.now() - t) + 'ms, ' + text.length + 'B');
+                    return text;
+                }, function (e) {
+                    // Logged per job, not just in aggregate: one language failing while
+                    // the rest succeed is a different problem from all of them failing,
+                    // and only the per-job line separates them.
+                    console.log('[app-tweaks] prefetch ' + label + ' FAILED after '
+                        + Math.round(performance.now() - t) + 'ms: ' + e);
+                    throw e;
+                });
+            }
+
+            // sendApiRequest calls request.send() with NO argument, so the key the shim
+            // computes has an empty body segment. Pass undefined here to match it.
+            // trackWin=true: getgraph is the endpoint the page's OWN first synchronous
+            // call always races against (it fires during body parsing, before anything
+            // else the page does), so this is the one call whose network-vs-skipped
+            // outcome actually answers "did the prefetch win".
+            post(graphUrl, undefined, 'getgraph', true).then(function (text) {
+                var graph = JSON.parse(text);
+                var jobs = [];
+                var workers = 0;
+                for (var worker in graph) {
+                    if (!Object.prototype.hasOwnProperty.call(graph, worker)) continue;
+                    workers++;
+                    var downstream = graph[worker];
+                    // Mirrors updateWindowContent's own filter, index.html:2990.
+                    if (!downstream || String(downstream).indexOf('api') < 0) continue;
+                    var stream = worker.split(':')[1];
+                    if (!stream) continue;
+                    // The site double-encodes: JSON.stringify(JSON.stringify(obj)) -- a
+                    // JSON string CONTAINING a JSON string (index.html:2995). The key must
+                    // match byte for byte, so build the body identically.
+                    jobs.push(post(
+                        base + '/' + stream + '/get_output_language_component',
+                        JSON.stringify(JSON.stringify({ component: worker })),
+                        'lang ' + worker
+                    ).then(function () { return true; }, function () { return false; }));
+                }
+                // workers vs jobs.length is the check that the graph parsed into what this
+                // expects: if a shape change makes the 'api' filter match nothing, jobs is
+                // 0 while workers is not, and only this line shows it.
+                console.log('[app-tweaks] prefetch getgraph parsed: ' + workers
+                    + ' workers, ' + jobs.length + ' with api');
+                var t1 = performance.now();
+                return Promise.all(jobs).then(function (results) {
+                    var ok = 0;
+                    for (var i = 0; i < results.length; i++) if (results[i]) ok++;
+                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok, '
+                        + (results.length - ok) + ' failed in '
+                        + Math.round(performance.now() - t1) + 'ms, '
+                        + Object.keys(store).length + ' keys stored');
+                });
+            }).catch(function (e) {
+                console.log('[app-tweaks] prefetch getgraph failed: ' + e
+                    + ' (page falls back to its own synchronous call)');
+            });
+        }
+
         // Before killOverlays and outside setup(): these need no document.body, and they
         // have to be in place before the user presses record -- and, for the AudioContext
         // patch, before the page's own load-time recording() call -- not merely before
         // load ends.
         patchAudioContext();
+        // Must be in place before the site's own scripts run -- the first synchronous
+        // getgraph happens during body parsing, via showWindow -> updateWindowContent
+        // (index.html:1223) -- not merely before load ends.
+        syncXhrCache();
         // Guard hoisted out of shortCircuitResampler and up to here: SITE_TWEAKS_JS is
         // injected four times per page load, and if waveResampler never loads (CDN
         // unreachable), each injection would otherwise start its own 250ms x 120 polling
@@ -1539,6 +1832,71 @@ private val SITE_TWEAKS_JS = """
                 function () { return !!(window.waveResampler && window.waveResampler.resample); },
                 shortCircuitResampler,
                 'waveResampler');
+        }
+        // MUST be armed here, in the pre-setup block, NOT from inside setup(). setup() is
+        // armed on DOMContentLoaded, but the page's OWN first synchronous getgraph fires
+        // during body parsing -- showWindow() -> updateWindowContent() -> getGraph(),
+        // documented at site-reference/present/index.html:18-19 -- which is BEFORE
+        // DOMContentLoaded. A prefetch that waited for setup() would lose that race every
+        // time and just warm a cache nobody reads.
+        //
+        // A POLL for window.sessionId loses this race too, and did in an earlier version
+        // of this patch: window.sessionId is assigned at index.html:17, in a <head>
+        // script, before body parsing starts, but whenDefined's first REAL check (after
+        // its immediate, too-early one) is its first setInterval tick -- 250ms later. On
+        // the vendored snapshot the page's own first synchronous getgraph completes well
+        // inside that 250ms, so a poll-driven prefetch always arrived after the page had
+        // already made (and cached) that first call itself. The test still read
+        // stats.hit > 0 as success, but that hit came from Task 2's memoization of the
+        // page's OWN second getgraph call, not from this prefetch beating anything --
+        // measured and reasoned through on 2026-08-31 (task-3-report.md, "Fix round 1").
+        //
+        // Fix: hook the ASSIGNMENT itself with an accessor, so the prefetch fires
+        // SYNCHRONOUSLY in the same tick as `window.sessionId = "..."` runs in <head> --
+        // before ANY body script, the getgraph call included, has had a chance to run.
+        if (!window.__appPrefetchArmed) {
+            window.__appPrefetchArmed = true;
+            var sessionIdDesc = Object.getOwnPropertyDescriptor(window, 'sessionId');
+            if (sessionIdDesc && Object.prototype.hasOwnProperty.call(sessionIdDesc, 'value')) {
+                // Already a plain value: the page's <head> script ran before this
+                // injection landed (SITE_TWEAKS_JS runs from onPageStarted, which is not
+                // guaranteed to win against <head>, only likely to). No accessor needed
+                // -- just use what's already there.
+                prefetchImmutable();
+            } else {
+                var sessionIdBacking;
+                try {
+                    Object.defineProperty(window, 'sessionId', {
+                        configurable: true,
+                        get: function () { return sessionIdBacking; },
+                        set: function (v) {
+                            // Store first, so webapiBase() (called from inside
+                            // prefetchImmutable, synchronously, below) reads a page that
+                            // already looks like it has a sessionId -- exactly as it would
+                            // with no accessor here at all. The page's own later reads of
+                            // window.sessionId keep working the same way, through this same
+                            // getter: transparent from its point of view.
+                            sessionIdBacking = v;
+                            prefetchImmutable();
+                        }
+                    });
+                } catch (e) {
+                    // Some future page could make window.sessionId non-configurable, or
+                    // otherwise refuse this. __appPrefetchArmed is already latched above,
+                    // so there is no retry of this block -- but the fallback poll right
+                    // below still catches the value once the page assigns it, just later.
+                    console.log('[app-tweaks] sessionId accessor refused (' + e
+                        + '), prefetch falls back to polling');
+                }
+            }
+            // Fallback for a page that never assigns window.sessionId at all -- only the
+            // <script>-text scan in webapiBase() can find a session id then. Belt and
+            // braces: prefetchImmutable() is idempotent (window.__appPrefetched), so this
+            // cannot double-fire if the accessor above already won the race.
+            whenDefined(
+                function () { return !!webapiBase(); },
+                prefetchImmutable,
+                'session id (prefetch, fallback poll)');
         }
         applyCaptureMode();
         killOverlays();
