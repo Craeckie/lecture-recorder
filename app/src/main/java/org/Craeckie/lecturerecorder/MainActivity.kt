@@ -1716,21 +1716,31 @@ private val SITE_TWEAKS_JS = """
             console.log('[app-tweaks] sync-xhr base=' + redactPath(base)
                 + ' from ' + (window.sessionId ? 'window.sessionId' : 'page scripts'));
 
-            function post(url, body, label) {
-                // The page's own synchronous XHR for this same key can win the race --
-                // it fires during body parsing, which starts before this prefetch's
-                // whenDefined poll can possibly resolve. If it already stored a response,
-                // fetching again here would be a second, redundant hit to the network for
-                // an endpoint that is supposed to reach it AT MOST once. Read the store
-                // first and short-circuit on whatever is already there, success or not:
-                // this function only ever races the page's own cacheable calls, and those
-                // only store on a 200 (see syncXhrCache's STORE branch), so anything found
-                // here is already a good response.
+            function post(url, body, label, trackWin) {
+                // The page's own synchronous XHR for this same key can still win the
+                // race -- e.g. on a page whose sessionId assignment is caught only by
+                // the fallback poll below, or simply a slower network for THIS
+                // particular job. If it already stored a response, fetching again here
+                // would be a second, redundant hit to the network for an endpoint that
+                // is supposed to reach it AT MOST once. Read the store first and
+                // short-circuit on whatever is already there, success or not: this
+                // function only ever races the page's own cacheable calls, and those
+                // only store on a 200 (see syncXhrCache's STORE branch), so anything
+                // found here is already a good response.
                 var key = cacheKey('POST', url, body);
                 if (Object.prototype.hasOwnProperty.call(store, key)) {
                     console.log('[app-tweaks] prefetch ' + label
                         + ' already cached (page won the race), skipping fetch');
                     return Promise.resolve(store[key]);
+                }
+                if (trackWin) {
+                    // Recorded HERE, at the instant the store-check found nothing --
+                    // not after the fetch resolves. Winning the race this task exists
+                    // to win is about being FIRST TO ASK, not about resolving fastest;
+                    // tools/site-patches-test.mjs reads this flag to tell "the prefetch
+                    // actually reached the network ahead of the page" apart from "the
+                    // prefetch never got the chance to try".
+                    window.__appPrefetchWon = true;
                 }
                 var t = performance.now();
                 return fetch(url, {
@@ -1757,7 +1767,11 @@ private val SITE_TWEAKS_JS = """
 
             // sendApiRequest calls request.send() with NO argument, so the key the shim
             // computes has an empty body segment. Pass undefined here to match it.
-            post(graphUrl, undefined, 'getgraph').then(function (text) {
+            // trackWin=true: getgraph is the endpoint the page's OWN first synchronous
+            // call always races against (it fires during body parsing, before anything
+            // else the page does), so this is the one call whose network-vs-skipped
+            // outcome actually answers "did the prefetch win".
+            post(graphUrl, undefined, 'getgraph', true).then(function (text) {
                 var graph = JSON.parse(text);
                 var jobs = [];
                 var workers = 0;
@@ -1824,21 +1838,56 @@ private val SITE_TWEAKS_JS = """
         // during body parsing -- showWindow() -> updateWindowContent() -> getGraph(),
         // documented at site-reference/present/index.html:18-19 -- which is BEFORE
         // DOMContentLoaded. A prefetch that waited for setup() would lose that race every
-        // time and just warm a cache nobody reads. window.sessionId is set in <head>
-        // (index.html:19), before any body script, so poll for it with whenDefined rather
-        // than assuming it already exists at the instant SITE_TWEAKS_JS runs (this script
-        // is injected at onPageStarted, which can itself run before <head> executes).
+        // time and just warm a cache nobody reads.
         //
-        // Guard hoisted the same way as the resampler wait just above: SITE_TWEAKS_JS is
-        // injected four times per page load, and setting the flag before the wait starts
-        // (not only once the prefetch lands) keeps every injection after the first a no-op
-        // instead of starting its own 250ms x 120 polling interval.
+        // A POLL for window.sessionId loses this race too, and did in an earlier version
+        // of this patch: window.sessionId is assigned at index.html:17, in a <head>
+        // script, before body parsing starts, but whenDefined's first REAL check (after
+        // its immediate, too-early one) is its first setInterval tick -- 250ms later. On
+        // the vendored snapshot the page's own first synchronous getgraph completes well
+        // inside that 250ms, so a poll-driven prefetch always arrived after the page had
+        // already made (and cached) that first call itself. The test still read
+        // stats.hit > 0 as success, but that hit came from Task 2's memoization of the
+        // page's OWN second getgraph call, not from this prefetch beating anything --
+        // measured and reasoned through on 2026-08-31 (task-3-report.md, "Fix round 1").
+        //
+        // Fix: hook the ASSIGNMENT itself with an accessor, so the prefetch fires
+        // SYNCHRONOUSLY in the same tick as `window.sessionId = "..."` runs in <head> --
+        // before ANY body script, the getgraph call included, has had a chance to run.
         if (!window.__appPrefetchArmed) {
             window.__appPrefetchArmed = true;
+            var sessionIdDesc = Object.getOwnPropertyDescriptor(window, 'sessionId');
+            if (sessionIdDesc && Object.prototype.hasOwnProperty.call(sessionIdDesc, 'value')) {
+                // Already a plain value: the page's <head> script ran before this
+                // injection landed (SITE_TWEAKS_JS runs from onPageStarted, which is not
+                // guaranteed to win against <head>, only likely to). No accessor needed
+                // -- just use what's already there.
+                prefetchImmutable();
+            } else {
+                var sessionIdBacking;
+                Object.defineProperty(window, 'sessionId', {
+                    configurable: true,
+                    get: function () { return sessionIdBacking; },
+                    set: function (v) {
+                        // Store first, so webapiBase() (called from inside
+                        // prefetchImmutable, synchronously, below) reads a page that
+                        // already looks like it has a sessionId -- exactly as it would
+                        // with no accessor here at all. The page's own later reads of
+                        // window.sessionId keep working the same way, through this same
+                        // getter: transparent from its point of view.
+                        sessionIdBacking = v;
+                        prefetchImmutable();
+                    }
+                });
+            }
+            // Fallback for a page that never assigns window.sessionId at all -- only the
+            // <script>-text scan in webapiBase() can find a session id then. Belt and
+            // braces: prefetchImmutable() is idempotent (window.__appPrefetched), so this
+            // cannot double-fire if the accessor above already won the race.
             whenDefined(
                 function () { return !!webapiBase(); },
                 prefetchImmutable,
-                'session id (prefetch)');
+                'session id (prefetch, fallback poll)');
         }
         applyCaptureMode();
         killOverlays();
