@@ -1675,6 +1675,129 @@ private val SITE_TWEAKS_JS = """
             console.log('[app-tweaks] sync-xhr cache armed');
         }
 
+        // The session id: window.sessionId is set in <head> (index.html:19,
+        // `window.sessionId = "2716...477"`), before any body script runs. Prefer it --
+        // it's exact and cheap. Fall back to scanning <script> text for a literal
+        // /webapi/<id>/ path (present on the vendored snapshot at index.html:415 etc.) for
+        // a page that never sets the global. Scan only <script> text, not the whole
+        // document, so the fallback stays cheap too.
+        function webapiBase() {
+            if (window.sessionId) return '/webapi/' + window.sessionId;
+            var scripts = document.getElementsByTagName('script');
+            for (var i = 0; i < scripts.length; i++) {
+                var m = (scripts[i].textContent || '')
+                    .match(/["']\/webapi\/([0-9a-zA-Z]{16,})\//);
+                if (m) return '/webapi/' + m[1];
+            }
+            return null;
+        }
+
+        // Warm the cache syncXhrCache() reads, before the page's synchronous calls run.
+        // Entirely best-effort: on any failure the page falls back to exactly today's
+        // behaviour, which is the same synchronous call it makes now.
+        //
+        // Uses fetch, not XHR, so these do not go through the shim's own wrapper and
+        // cannot recurse. Same-origin credentials are the fetch default, which is what the
+        // site's Dex session cookie needs -- do not "tidy" that to omit.
+        function prefetchImmutable() {
+            if (window.__appPrefetched) return;
+            var base = webapiBase();
+            if (!base) {
+                console.log('[app-tweaks] prefetch skipped: no session id yet');
+                return;
+            }
+            window.__appPrefetched = true;
+            var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
+            var t0 = performance.now();
+            var graphUrl = base + '/getgraph';
+            // redactPath() so the session id never reaches a log export, exactly as in
+            // syncXhrCache. This line is how you tell "the prefetch never ran" apart from
+            // "it ran against the wrong base path".
+            console.log('[app-tweaks] sync-xhr base=' + redactPath(base)
+                + ' from ' + (window.sessionId ? 'window.sessionId' : 'page scripts'));
+
+            function post(url, body, label) {
+                // The page's own synchronous XHR for this same key can win the race --
+                // it fires during body parsing, which starts before this prefetch's
+                // whenDefined poll can possibly resolve. If it already stored a response,
+                // fetching again here would be a second, redundant hit to the network for
+                // an endpoint that is supposed to reach it AT MOST once. Read the store
+                // first and short-circuit on whatever is already there, success or not:
+                // this function only ever races the page's own cacheable calls, and those
+                // only store on a 200 (see syncXhrCache's STORE branch), so anything found
+                // here is already a good response.
+                var key = cacheKey('POST', url, body);
+                if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    console.log('[app-tweaks] prefetch ' + label
+                        + ' already cached (page won the race), skipping fetch');
+                    return Promise.resolve(store[key]);
+                }
+                var t = performance.now();
+                return fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+                    body: body
+                }).then(function (r) {
+                    if (r.status !== 200) throw new Error('HTTP ' + r.status);
+                    return r.text();
+                }).then(function (text) {
+                    store[cacheKey('POST', url, body)] = text;
+                    console.log('[app-tweaks] prefetch ' + label + ' ok in '
+                        + Math.round(performance.now() - t) + 'ms, ' + text.length + 'B');
+                    return text;
+                }, function (e) {
+                    // Logged per job, not just in aggregate: one language failing while
+                    // the rest succeed is a different problem from all of them failing,
+                    // and only the per-job line separates them.
+                    console.log('[app-tweaks] prefetch ' + label + ' FAILED after '
+                        + Math.round(performance.now() - t) + 'ms: ' + e);
+                    throw e;
+                });
+            }
+
+            // sendApiRequest calls request.send() with NO argument, so the key the shim
+            // computes has an empty body segment. Pass undefined here to match it.
+            post(graphUrl, undefined, 'getgraph').then(function (text) {
+                var graph = JSON.parse(text);
+                var jobs = [];
+                var workers = 0;
+                for (var worker in graph) {
+                    if (!Object.prototype.hasOwnProperty.call(graph, worker)) continue;
+                    workers++;
+                    var downstream = graph[worker];
+                    // Mirrors updateWindowContent's own filter, index.html:2990.
+                    if (!downstream || String(downstream).indexOf('api') < 0) continue;
+                    var stream = worker.split(':')[1];
+                    if (!stream) continue;
+                    // The site double-encodes: JSON.stringify(JSON.stringify(obj)) -- a
+                    // JSON string CONTAINING a JSON string (index.html:2995). The key must
+                    // match byte for byte, so build the body identically.
+                    jobs.push(post(
+                        base + '/' + stream + '/get_output_language_component',
+                        JSON.stringify(JSON.stringify({ component: worker })),
+                        'lang ' + worker
+                    ).then(function () { return true; }, function () { return false; }));
+                }
+                // workers vs jobs.length is the check that the graph parsed into what this
+                // expects: if a shape change makes the 'api' filter match nothing, jobs is
+                // 0 while workers is not, and only this line shows it.
+                console.log('[app-tweaks] prefetch getgraph parsed: ' + workers
+                    + ' workers, ' + jobs.length + ' with api');
+                var t1 = performance.now();
+                return Promise.all(jobs).then(function (results) {
+                    var ok = 0;
+                    for (var i = 0; i < results.length; i++) if (results[i]) ok++;
+                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok, '
+                        + (results.length - ok) + ' failed in '
+                        + Math.round(performance.now() - t1) + 'ms, '
+                        + Object.keys(store).length + ' keys stored');
+                });
+            }).catch(function (e) {
+                console.log('[app-tweaks] prefetch getgraph failed: ' + e
+                    + ' (page falls back to its own synchronous call)');
+            });
+        }
+
         // Before killOverlays and outside setup(): these need no document.body, and they
         // have to be in place before the user presses record -- and, for the AudioContext
         // patch, before the page's own load-time recording() call -- not merely before
@@ -1695,6 +1818,27 @@ private val SITE_TWEAKS_JS = """
                 function () { return !!(window.waveResampler && window.waveResampler.resample); },
                 shortCircuitResampler,
                 'waveResampler');
+        }
+        // MUST be armed here, in the pre-setup block, NOT from inside setup(). setup() is
+        // armed on DOMContentLoaded, but the page's OWN first synchronous getgraph fires
+        // during body parsing -- showWindow() -> updateWindowContent() -> getGraph(),
+        // documented at site-reference/present/index.html:18-19 -- which is BEFORE
+        // DOMContentLoaded. A prefetch that waited for setup() would lose that race every
+        // time and just warm a cache nobody reads. window.sessionId is set in <head>
+        // (index.html:19), before any body script, so poll for it with whenDefined rather
+        // than assuming it already exists at the instant SITE_TWEAKS_JS runs (this script
+        // is injected at onPageStarted, which can itself run before <head> executes).
+        //
+        // Guard hoisted the same way as the resampler wait just above: SITE_TWEAKS_JS is
+        // injected four times per page load, and setting the flag before the wait starts
+        // (not only once the prefetch lands) keeps every injection after the first a no-op
+        // instead of starting its own 250ms x 120 polling interval.
+        if (!window.__appPrefetchArmed) {
+            window.__appPrefetchArmed = true;
+            whenDefined(
+                function () { return !!webapiBase(); },
+                prefetchImmutable,
+                'session id (prefetch)');
         }
         applyCaptureMode();
         killOverlays();
