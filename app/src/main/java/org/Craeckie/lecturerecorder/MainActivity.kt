@@ -1523,11 +1523,167 @@ private val SITE_TWEAKS_JS = """
             console.log('[app-tweaks] waveResampler.resample short-circuited for equal rates');
         }
 
+        // The site issues SYNCHRONOUS XMLHttpRequests -- request.open(..., false) -- from
+        // five call sites (present/index.html:2947, 2993, 3021, 5857, 5887). Each freezes
+        // the main thread for a full round trip: measured at ~90ms of SERVER time on good
+        // WiFi, plus 150-250ms RTT on this app's normal link. Page load serialized ~36 of
+        // them for 3.3s.
+        //
+        // Two of the three endpoints are immutable for the lifetime of a session -- they
+        // describe the pipeline topology and its language mapping, neither of which
+        // changes while a lecture runs -- so a repeat call can be answered from memory.
+        //
+        // /get_previous_messages is NOT one of them: it is range-dependent and carries
+        // lecture content. It is deliberately absent from this list and must stay absent.
+        var IMMUTABLE_SYNC_PATHS = ['/getgraph', '/get_output_language_component'];
+
+        function isImmutableSyncPath(url) {
+            var path = String(url).split('?')[0];
+            for (var i = 0; i < IMMUTABLE_SYNC_PATHS.length; i++) {
+                if (path.indexOf(IMMUTABLE_SYNC_PATHS[i]) >= 0) return true;
+            }
+            return false;
+        }
+
+        // A THIRD copy of redactIds -- NET_TRACE_JS:170 and PERF_TRACE_JS:357 have the
+        // other two, and :355 already documents why they are not shared. The reason for
+        // this one is different and stronger: both of those are injected in DEBUG builds
+        // only, while SITE_TWEAKS_JS ships in release. The session id is a long hex path
+        // SEGMENT, not a query param, so stripping query strings would not keep it out of
+        // a log export. Every path this patch logs goes through here.
+        function redactPath(url) {
+            var p;
+            try { p = new URL(String(url), location.href).pathname; }
+            catch (e) { p = String(url).split('?')[0]; }
+            return p.replace(/\/[0-9a-f]{20,}/gi, '/<id>');
+        }
+
+        // The prefetch writes into the same store the shim reads, so both MUST build the
+        // key the same way. Body included: get_output_language_component is one path
+        // serving many workers, discriminated only by its body.
+        function cacheKey(method, url, body) {
+            return String(method) + ' ' + String(url).split('?')[0]
+                + ' ' + (body == null ? '' : String(body));
+        }
+
+        function syncXhrCache() {
+            if (window.__appSyncXhrPatched) return;
+            window.__appSyncXhrPatched = true;
+            var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
+            var stats = window.__appSyncXhrStats = window.__appSyncXhrStats
+                || { hit: 0, miss: 0, stored: 0, passthrough: 0, refused: 0 };
+            var origOpen = XMLHttpRequest.prototype.open;
+            var origSend = XMLHttpRequest.prototype.send;
+            var SHADOWED = ['readyState', 'status', 'responseText'];
+            // A lecture is an hour long, so per-call logging has to be bounded. HITs are
+            // sampled then counted; MISS and STORE are always logged because there is at
+            // most one of each per distinct key, and they are exactly the lines you need
+            // when the cache is not working. See the spec's "Noise control".
+            var HIT_LOG_CAP = 5;
+            // ~90ms of server time per avoided round trip, measured on device 2026-08-30
+            // on good WiFi. An estimate for the log line, not a measurement.
+            var SAVED_MS_EACH = 90;
+
+            XMLHttpRequest.prototype.open = function (method, url, async) {
+                // updateWindowContent (index.html:2988-3008) creates ONE XMLHttpRequest
+                // and reuses it across every worker in the graph. A previous cache hit
+                // left own data properties on this object shadowing the prototype
+                // accessors; if they survive into the next request, its real response is
+                // read through them. Clear them on every open().
+                for (var i = 0; i < SHADOWED.length; i++) {
+                    if (Object.prototype.hasOwnProperty.call(this, SHADOWED[i])) {
+                        delete this[SHADOWED[i]];
+                    }
+                }
+                this.__appSync = (async === false);
+                this.__appCacheable = this.__appSync && isImmutableSyncPath(url);
+                this.__appMethod = method;
+                this.__appUrl = url;
+                return origOpen.apply(this, arguments);
+            };
+
+            XMLHttpRequest.prototype.send = function (body) {
+                if (!this.__appCacheable) {
+                    // Every /get_previous_messages lands here. Counted, never logged
+                    // individually: there are hundreds an hour and their bodies and
+                    // responses are lecture content.
+                    if (this.__appSync) stats.passthrough++;
+                    return origSend.apply(this, arguments);
+                }
+                var key = cacheKey(this.__appMethod, this.__appUrl, body);
+                var shown = 'POST ' + redactPath(this.__appUrl)
+                    + (body == null ? '' : ' body=' + String(body).slice(0, 80));
+                if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    // Own data properties shadow the prototype's accessors, so the
+                    // synchronous caller reads a complete 200 without a round trip.
+                    Object.defineProperty(this, 'readyState',
+                        { value: 4, configurable: true });
+                    Object.defineProperty(this, 'status',
+                        { value: 200, configurable: true });
+                    Object.defineProperty(this, 'responseText',
+                        { value: store[key], configurable: true });
+                    stats.hit++;
+                    if (stats.hit <= HIT_LOG_CAP) {
+                        console.log('[app-tweaks] sync-xhr HIT  ' + shown);
+                    }
+                    return;
+                }
+                var result = origSend.apply(this, arguments);
+                stats.miss++;
+                // Always logged, and it prints the exact key that was looked up. A MISS
+                // on an immutable path AFTER the prefetch reported keys stored is the
+                // signature of a key mismatch between the two sides -- the most likely
+                // bug in this patch -- and this line plus the STORE line below are what
+                // let you diff the two keys from logcat alone.
+                console.log('[app-tweaks] sync-xhr MISS ' + shown);
+                // Only a 200 is stored. A cached failure would be pinned for the whole
+                // lecture -- and getGraph() falls back to the internal ltapi:5000 host on
+                // non-200, which does not resolve off-site and hangs.
+                try {
+                    if (this.status === 200) {
+                        store[key] = this.responseText;
+                        stats.stored++;
+                        console.log('[app-tweaks] sync-xhr STORE ' + shown
+                            + ' (200, ' + String(this.responseText || '').length + 'B)');
+                    } else {
+                        stats.refused++;
+                        console.log('[app-tweaks] sync-xhr NOT CACHED ' + shown
+                            + ' (status ' + this.status + ')');
+                    }
+                } catch (e) {
+                    // A cross-origin or errored request can throw on responseText; a miss
+                    // that stores nothing is the correct outcome.
+                    stats.refused++;
+                    console.log('[app-tweaks] sync-xhr NOT CACHED ' + shown
+                        + ' (threw: ' + e + ')');
+                }
+                return result;
+            };
+
+            function summary(why) {
+                console.log('[app-tweaks] sync-xhr summary (' + why + '): hit=' + stats.hit
+                    + ' miss=' + stats.miss + ' stored=' + stats.stored
+                    + ' refused=' + stats.refused
+                    + ' passthrough=' + stats.passthrough
+                    + ' savedApprox=' + (stats.hit * SAVED_MS_EACH) + 'ms');
+            }
+            // One line after the load burst has settled, and one on the way out, so a
+            // logcat export taken at any point in a lecture has a total in it.
+            setTimeout(function () { summary('12s'); }, 12000);
+            window.addEventListener('pagehide', function () { summary('pagehide'); });
+
+            console.log('[app-tweaks] sync-xhr cache armed');
+        }
+
         // Before killOverlays and outside setup(): these need no document.body, and they
         // have to be in place before the user presses record -- and, for the AudioContext
         // patch, before the page's own load-time recording() call -- not merely before
         // load ends.
         patchAudioContext();
+        // Must be in place before the site's own scripts run -- the first synchronous
+        // getgraph happens during body parsing, via showWindow -> updateWindowContent
+        // (index.html:1223) -- not merely before load ends.
+        syncXhrCache();
         // Guard hoisted out of shortCircuitResampler and up to here: SITE_TWEAKS_JS is
         // injected four times per page load, and if waveResampler never loads (CDN
         // unreachable), each injection would otherwise start its own 250ms x 120 polling
