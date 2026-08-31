@@ -1611,7 +1611,7 @@ private val SITE_TWEAKS_JS = """
                     return origSend.apply(this, arguments);
                 }
                 var key = cacheKey(this.__appMethod, this.__appUrl, body);
-                var shown = 'POST ' + redactPath(this.__appUrl)
+                var shown = String(this.__appMethod) + ' ' + redactPath(this.__appUrl)
                     + (body == null ? '' : ' body=' + String(body).slice(0, 80));
                 if (Object.prototype.hasOwnProperty.call(store, key)) {
                     // Own data properties shadow the prototype's accessors, so the
@@ -1865,20 +1865,29 @@ private val SITE_TWEAKS_JS = """
                 prefetchImmutable();
             } else {
                 var sessionIdBacking;
-                Object.defineProperty(window, 'sessionId', {
-                    configurable: true,
-                    get: function () { return sessionIdBacking; },
-                    set: function (v) {
-                        // Store first, so webapiBase() (called from inside
-                        // prefetchImmutable, synchronously, below) reads a page that
-                        // already looks like it has a sessionId -- exactly as it would
-                        // with no accessor here at all. The page's own later reads of
-                        // window.sessionId keep working the same way, through this same
-                        // getter: transparent from its point of view.
-                        sessionIdBacking = v;
-                        prefetchImmutable();
-                    }
-                });
+                try {
+                    Object.defineProperty(window, 'sessionId', {
+                        configurable: true,
+                        get: function () { return sessionIdBacking; },
+                        set: function (v) {
+                            // Store first, so webapiBase() (called from inside
+                            // prefetchImmutable, synchronously, below) reads a page that
+                            // already looks like it has a sessionId -- exactly as it would
+                            // with no accessor here at all. The page's own later reads of
+                            // window.sessionId keep working the same way, through this same
+                            // getter: transparent from its point of view.
+                            sessionIdBacking = v;
+                            prefetchImmutable();
+                        }
+                    });
+                } catch (e) {
+                    // Some future page could make window.sessionId non-configurable, or
+                    // otherwise refuse this. __appPrefetchArmed is already latched above,
+                    // so there is no retry of this block -- but the fallback poll right
+                    // below still catches the value once the page assigns it, just later.
+                    console.log('[app-tweaks] sessionId accessor refused (' + e
+                        + '), prefetch falls back to polling');
+                }
             }
             // Fallback for a page that never assigns window.sessionId at all -- only the
             // <script>-text scan in webapiBase() can find a session id then. Belt and
