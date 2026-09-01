@@ -1441,8 +1441,9 @@ private val SITE_TWEAKS_JS = """
         // ONLY the capture context is retuned. AudioQueuePlayer constructs one AudioContext
         // per TTS player for PLAYBACK; forcing 16 kHz on those would degrade TTS output.
         // Which context IS the capture one is decided semantically, by the constructing
-        // call stack (see isCaptureConstruction() below) -- not by construction order,
-        // which tools/site-patches-test.mjs asserts.
+        // call stack (see isCaptureConstruction() below) -- not by construction order.
+        // tools/site-patches-test.mjs asserts that the capture context is still the one
+        // retuned to 16 kHz under this rule.
         function patchAudioContext() {
             if (window.__appAudioPatched) return;
             var Native = window.AudioContext || window.webkitAudioContext;
@@ -1500,9 +1501,9 @@ private val SITE_TWEAKS_JS = """
             }
 
             var Wrapped = function (options) {
-                var isFirst = isCaptureConstruction();
+                var isCapture = isCaptureConstruction();
                 var opts = options;
-                if (isFirst) {
+                if (isCapture) {
                     opts = {};
                     if (options) {
                         for (var k in options) {
@@ -1522,11 +1523,11 @@ private val SITE_TWEAKS_JS = """
                     ctx = new Native(options);
                 }
                 window.__appAllCtxRates.push(ctx.sampleRate);
-                if (isFirst) window.__appCaptureCtx = ctx;
+                if (isCapture) window.__appCaptureCtx = ctx;
                 live.push(ctx);
                 console.log('[app-tweaks] AudioContext ' + window.__appAllCtxRates.length
                     + ' created, state=' + ctx.state + ' rate=' + ctx.sampleRate
-                    + (isFirst ? ' (capture)' : ' (playback)'));
+                    + (isCapture ? ' (capture)' : ' (playback)'));
                 kick(ctx, 'on create');
                 ctx.addEventListener('statechange', function () {
                     console.log('[app-tweaks] AudioContext state -> ' + ctx.state);
@@ -2039,12 +2040,23 @@ class MainActivity : ComponentActivity() {
     private val micPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             Log.i(LOG_TAG, "RECORD_AUDIO granted=$granted")
-            // Chained off this result rather than launched beside it: two launch() calls in
-            // one frame can drop one.
-            askForNotificationPermissionIfNeeded()
             val pending = pendingWebPermission
             pendingWebPermission = null
-            if (pending == null) return@registerForActivityResult
+            if (pending == null) {
+                // This launcher is shared between two callers: the startup request in
+                // onCreate (pendingWebPermission null, nothing to grant/deny) and
+                // handleWebAudioPermission's page-triggered request (pendingWebPermission
+                // set). Chained off this result rather than launched beside it: two
+                // launch() calls in one frame can drop one. But that reasoning only holds
+                // for the startup path -- popping a second system dialog for
+                // POST_NOTIFICATIONS is fine before the page has asked for anything, and
+                // wrong the moment it's actually trying to start a recording, since the
+                // notification dialog would sit on top of the page while
+                // pending.grant() lets getUserMedia resolve and capture go live behind it.
+                // So this only runs on the startup path, where pending is null.
+                askForNotificationPermissionIfNeeded()
+                return@registerForActivityResult
+            }
             if (granted) {
                 pending.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
             } else {
@@ -2238,8 +2250,13 @@ class MainActivity : ComponentActivity() {
 
 // The one condition the wrapped site cannot show, because it cannot see it: the platform is
 // handing this app zeros and the page's recording UI looks entirely healthy. Full-width,
-// error-coloured and not dismissible — an 87-second hole in a lecture is worth covering a
-// strip of the page for. See docs/superpowers/specs/2026-09-01-device-log-findings.md.
+// error-coloured and not dismissible. The backgrounding hole that motivated building this
+// (86.5 s lost on 2026-09-01) is now covered by CaptureForegroundService instead — and by
+// definition the banner is off-screen while backgrounded anyway, clearing again the moment
+// the user foregrounds and the silencing ends. What the banner is actually for is the cases
+// the service cannot fix: the OS privacy mic toggle, an incoming call, or another app taking
+// the microphone — all silent to the page, and all needing a human to notice and react while
+// looking at the screen. See docs/superpowers/specs/2026-09-01-device-log-findings.md.
 @Composable
 fun CaptureSilencedBanner(visible: Boolean, modifier: Modifier = Modifier) {
     if (!visible) return

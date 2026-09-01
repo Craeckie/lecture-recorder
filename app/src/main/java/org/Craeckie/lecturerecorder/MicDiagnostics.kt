@@ -142,6 +142,9 @@ class MicDiagnostics(
             captureActive = active
             onCaptureActiveChanged(active)
         }
+        // isClientSilenced is API 29+; minSdk is 26, so on API 26-28 silencedFlags is always
+        // empty and CaptureSilencedBanner can never show — not a bug, just a floor on how
+        // old a device can be and still get this warning.
         val silencedFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             configs.map { it.isClientSilenced }
         } else {

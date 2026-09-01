@@ -43,7 +43,7 @@ class CaptureForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createChannel()
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.presence_audio_online)
+            .setSmallIcon(R.drawable.ic_notification_mic)
             .setContentTitle(getString(R.string.capture_notification_title))
             .setContentText(getString(R.string.capture_notification_text))
             .setOngoing(true)
@@ -84,6 +84,19 @@ class CaptureForegroundService : Service() {
     override fun onDestroy() {
         Log.i(LOG_TAG, "Capture foreground service stopped")
         super.onDestroy()
+    }
+
+    // Swiping the task away does not guarantee onDestroy runs (or runs promptly), and
+    // START_NOT_STICKY only covers the service getting killed outright -- not this case,
+    // where the process (and this service) can keep running with the activity gone. Without
+    // this override the service would go on holding the microphone exemption open and
+    // showing an ongoing "recording in progress" notification for a page that no longer
+    // exists, with no WebView left to ever end it. There is nothing left to record once the
+    // task is gone, so stop.
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Log.i(LOG_TAG, "Task removed; stopping the capture foreground service")
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun createChannel() {
