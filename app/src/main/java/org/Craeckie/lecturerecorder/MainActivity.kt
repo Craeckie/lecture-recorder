@@ -1436,10 +1436,11 @@ private val SITE_TWEAKS_JS = """
         //    low-pass, forward and backward over the buffer). Asking for a 16 kHz context
         //    makes Chromium resample natively, in the audio pipeline, off the main thread.
         //
-        // ONLY the first context is retuned. AudioQueuePlayer constructs one AudioContext
+        // ONLY the capture context is retuned. AudioQueuePlayer constructs one AudioContext
         // per TTS player for PLAYBACK; forcing 16 kHz on those would degrade TTS output.
-        // The capture context is the first the page constructs, which
-        // tools/site-patches-test.mjs asserts.
+        // Which context IS the capture one is decided semantically, by the constructing
+        // call stack (see isCaptureConstruction() below) -- not by construction order,
+        // which tools/site-patches-test.mjs asserts.
         function patchAudioContext() {
             if (window.__appAudioPatched) return;
             var Native = window.AudioContext || window.webkitAudioContext;
@@ -1457,6 +1458,33 @@ private val SITE_TWEAKS_JS = """
             var CAPTURE_BUFFER = 4096;
             var live = [];
 
+            // Which context is the CAPTURE one. This used to be "the first one the page
+            // constructs", which is positional, not semantic -- and finding 2c
+            // (docs/superpowers/specs/2026-09-01-device-log-findings.md) measured it
+            // misfiring on the archive/read path, where the page never records and the
+            // first context is therefore always an AudioQueuePlayer TTS context that got
+            // forced to 16 kHz.
+            //
+            // The site constructs the capture context on the first line of its top-level
+            // createAudioContext() (present/index.html:468) and every TTS context in the
+            // AudioQueuePlayer constructor, so the constructing call stack separates them.
+            //
+            // NOT gated on "has getUserMedia been called": createAudioContext() builds the
+            // context BEFORE it calls getUserMedia, so that flag is always false here.
+            //
+            // The stack is tested and thrown away, never logged -- its frame URLs contain
+            // the session id.
+            function isCaptureConstruction() {
+                var stack = null;
+                try { stack = new Error().stack; } catch (e) { stack = null; }
+                if (stack) return /\bcreateAudioContext\b/.test(stack);
+                // A JS engine with no Error.stack: fall back to the old positional rule,
+                // but only on a page that HAS a capture path at all. That keeps the
+                // archive page -- the case that actually broke -- correct either way.
+                return window.__appAllCtxRates.length === 0
+                    && typeof window.createAudioContext === 'function';
+            }
+
             function kick(ctx, why) {
                 if (!ctx || ctx.state !== 'suspended') return;
                 var p = ctx.resume();
@@ -1470,7 +1498,7 @@ private val SITE_TWEAKS_JS = """
             }
 
             var Wrapped = function (options) {
-                var isFirst = (window.__appAllCtxRates.length === 0);
+                var isFirst = isCaptureConstruction();
                 var opts = options;
                 if (isFirst) {
                     opts = {};
