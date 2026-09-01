@@ -11,6 +11,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
@@ -2037,6 +2038,9 @@ class MainActivity : ComponentActivity() {
     private val micPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             Log.i(LOG_TAG, "RECORD_AUDIO granted=$granted")
+            // Chained off this result rather than launched beside it: two launch() calls in
+            // one frame can drop one.
+            askForNotificationPermissionIfNeeded()
             val pending = pendingWebPermission
             pendingWebPermission = null
             if (pending == null) return@registerForActivityResult
@@ -2046,6 +2050,22 @@ class MainActivity : ComponentActivity() {
                 pending.deny()
             }
         }
+
+    // Requested only so the foreground service's ongoing notification is visible. The
+    // service runs either way; nothing is gated on the result, which is why it is not
+    // logged as a failure.
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            Log.i(LOG_TAG, "POST_NOTIFICATIONS granted=$granted")
+        }
+
+    private fun askForNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) return
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -2079,6 +2099,9 @@ class MainActivity : ComponentActivity() {
         // own recording UI mid-lecture.
         if (!hasMicPermission()) {
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            // No RECORD_AUDIO dialog is coming, so nothing to chain off.
+            askForNotificationPermissionIfNeeded()
         }
         setContent {
             AppTheme {
@@ -2111,12 +2134,28 @@ class MainActivity : ComponentActivity() {
     private fun onCaptureActiveChanged(active: Boolean) {
         captureActive = active
         setKeepScreenOn(active)
+        when (CaptureServiceControl.next(active, captureServiceRunning)) {
+            CaptureServiceControl.Action.START -> {
+                CaptureForegroundService.start(this)
+                captureServiceRunning = true
+            }
+            CaptureServiceControl.Action.STOP -> {
+                CaptureForegroundService.stop(this)
+                captureServiceRunning = false
+            }
+            CaptureServiceControl.Action.NONE -> Unit
+        }
     }
 
-    // A screen that sleeps mid-lecture kills the recording twice over, and silently: the
-    // site auto-mutes on visibilitychange, and Android silences the mic for a backgrounded
-    // app that has no microphone-type foreground service (see CLAUDE.md). Held only while
-    // capture is actually live, so ordinary browsing still lets the screen time out.
+    private var captureServiceRunning = false
+
+    // A screen that sleeps mid-lecture used to kill the recording silently: Android feeds a
+    // backgrounded app with no microphone-type foreground service digital silence rather
+    // than an error (86.5 s lost on 2026-09-01 — see the device-log findings). The service
+    // above is the fix for that; this flag is still held on top of it, because staying awake
+    // is the right default for a lecture and it also keeps the page's own SSE stream alive.
+    // Held only while capture is actually live, so ordinary browsing still lets the screen
+    // time out.
     private fun setKeepScreenOn(keepOn: Boolean) {
         Log.i(LOG_TAG, "FLAG_KEEP_SCREEN_ON ${if (keepOn) "set" else "cleared"}")
         if (keepOn) {
@@ -2168,6 +2207,10 @@ class MainActivity : ComponentActivity() {
     // Deliberately onDestroy and not onPause: the routing has to survive the screen going
     // off while a lecture is being recorded.
     override fun onDestroy() {
+        // The page lives in this activity's WebView, so once the activity is gone there is
+        // nothing left to record — the exemption must not outlive it.
+        CaptureForegroundService.stop(this)
+        captureServiceRunning = false
         micRouter.detach()
         micDiagnostics.detach()
         super.onDestroy()

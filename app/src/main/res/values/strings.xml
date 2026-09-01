@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Lecture Recorder</string>
+    <string name="capture_channel_name">Recording</string>
+    <string name="capture_notification_title">Lecture recording in progress</string>
+    <string name="capture_notification_text">Keeping the microphone open while the app is in the background.</string>
 </resources>
