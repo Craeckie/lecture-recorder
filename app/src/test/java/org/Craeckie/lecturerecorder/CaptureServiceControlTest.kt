@@ -40,4 +40,26 @@ class CaptureServiceControlTest {
             CaptureServiceControl.next(captureActive = false, running = false),
         )
     }
+
+    @Test
+    fun `after a start that failed to actually start, the next inactive signal is a no-op, not a stop`() {
+        // CaptureForegroundService.start() can fail (ForegroundServiceStartNotAllowedException
+        // on API 31+, or IllegalStateException) and reports that through its Boolean return
+        // rather than throwing, so a transient platform refusal degrades capture instead of
+        // crashing the activity mid-lecture. MainActivity.onCaptureActiveChanged is required
+        // to feed that real outcome -- not an assumed `true` -- into `running` on the next
+        // call. Simulating that here: a START was requested, but it did not actually start
+        // (running stays false), so the following capture=false signal must be NONE, not
+        // STOP -- there is nothing running to stop.
+        val requestedStart = CaptureServiceControl.next(captureActive = true, running = false)
+        assertEquals(CaptureServiceControl.Action.START, requestedStart)
+
+        val serviceActuallyRunning = false // what CaptureForegroundService.start() would
+        // return on failure, and what onCaptureActiveChanged would then store.
+
+        assertEquals(
+            CaptureServiceControl.Action.NONE,
+            CaptureServiceControl.next(captureActive = false, running = serviceActuallyRunning),
+        )
+    }
 }

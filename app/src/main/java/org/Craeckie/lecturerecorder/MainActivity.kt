@@ -2136,8 +2136,13 @@ class MainActivity : ComponentActivity() {
         setKeepScreenOn(active)
         when (CaptureServiceControl.next(active, captureServiceRunning)) {
             CaptureServiceControl.Action.START -> {
-                CaptureForegroundService.start(this)
-                captureServiceRunning = true
+                // start() never throws -- a failure to actually start is reported through
+                // the return value, not an exception, precisely so a transient platform
+                // refusal degrades to today's digital-silence behaviour instead of crashing
+                // the activity and ending the recording outright. Recording the real outcome
+                // here (rather than assuming true) is what lets the next STOP transition
+                // correctly become a no-op instead of stopping a service that isn't running.
+                captureServiceRunning = CaptureForegroundService.start(this)
             }
             CaptureServiceControl.Action.STOP -> {
                 CaptureForegroundService.stop(this)

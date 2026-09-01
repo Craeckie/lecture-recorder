@@ -11,16 +11,8 @@ import org.junit.Test
 // is visible in the app's UI when it breaks — the symptom is silence.
 class ForegroundServiceManifestTest {
     private val manifest: String by lazy {
-        // The JVM test's working directory is normally the app module, but that is a
-        // Gradle default, not a guarantee - fall back to locating the module root from
-        // user.dir rather than assuming it.
-        val relative = File("src/main/AndroidManifest.xml")
-        if (relative.isFile) {
-            relative.readText()
-        } else {
-            val moduleRoot = File(System.getProperty("user.dir"), "app")
-            File(moduleRoot, "src/main/AndroidManifest.xml").readText()
-        }
+        // The JVM test's working directory is the app module.
+        File("src/main/AndroidManifest.xml").readText()
     }
 
     @Test

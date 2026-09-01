@@ -65,8 +65,17 @@ class CaptureForegroundService : Service() {
         } else {
             0
         }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
-        Log.i(LOG_TAG, "Capture foreground service started (type=microphone)")
+        // On API 34+ this can throw SecurityException if RECORD_AUDIO is not held at the
+        // instant of the call (e.g. revoked between the activity's check and this running).
+        // A service that never reaches startForeground gets killed by the system anyway --
+        // stopSelf() here is an orderly version of that same outcome, not a new failure mode.
+        try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+            Log.i(LOG_TAG, "Capture foreground service started (type=microphone)")
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "startForeground failed, stopping service: $e")
+            stopSelf()
+        }
         // Not sticky: without the activity there is no WebView and no page, so a
         // resurrected service would hold the mic exemption open for nothing.
         return START_NOT_STICKY
@@ -95,11 +104,31 @@ class CaptureForegroundService : Service() {
         private const val CHANNEL_ID = "capture"
         private const val NOTIFICATION_ID = 1
 
-        fun start(context: Context) {
-            ContextCompat.startForegroundService(
-                context,
-                Intent(context, CaptureForegroundService::class.java),
-            )
+        // Returns whether the service was actually asked to start. Context.
+        // startForegroundService() can throw ForegroundServiceStartNotAllowedException
+        // (API 31+) or IllegalStateException if the process isn't in an exempted state at
+        // this exact instant -- both undocumented-until-you-hit-them edge cases, not just a
+        // theoretical possibility. Uncaught, that exception would propagate out of
+        // onCaptureActiveChanged and crash the activity, which kills the WebView and ends
+        // the recording outright (pitfall #9) -- strictly worse than the digital-silence bug
+        // this service exists to fix. So: catch broadly (the throwable set varies by API
+        // level and OEM), log, and let capture continue without the background exemption
+        // rather than take the whole app down.
+        fun start(context: Context): Boolean {
+            return try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, CaptureForegroundService::class.java),
+                )
+                true
+            } catch (e: Exception) {
+                Log.w(
+                    LOG_TAG,
+                    "Could not start the capture foreground service; capture will " +
+                        "continue but is NOT protected from background silencing: $e",
+                )
+                false
+            }
         }
 
         fun stop(context: Context) {
