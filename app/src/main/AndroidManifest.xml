@@ -7,6 +7,15 @@
          lets the shell pick the USB mic as the communication device (see MicRouter). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Since API 28, a backgrounded app with no microphone-type foreground service is fed
+         digital silence by the mic rather than an error. On 2026-09-01 that silently cost a
+         real lecture 86.5 seconds (see docs/superpowers/specs/2026-09-01-device-log-findings.md,
+         Part 1). CaptureForegroundService holds that exemption open while capture is live. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- API 33+. The service runs whether or not this is granted; without it the ongoing
+         notification is simply not shown, which is the user's only sign the mic is held. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:name=".LectureRecorderApplication"
@@ -54,6 +63,14 @@
                 <data android:scheme="https" android:host="lt2srv.iar.kit.edu" />
             </intent-filter>
         </activity>
+
+        <!-- exported=false: nothing outside this app has any business holding the
+             microphone exemption open. foregroundServiceType is required from API 34 and
+             ignored below it. -->
+        <service
+            android:name=".CaptureForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
     </application>
 </manifest>

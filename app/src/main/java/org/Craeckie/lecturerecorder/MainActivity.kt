@@ -11,6 +11,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.ViewGroup
@@ -55,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -131,6 +133,38 @@ private fun darkReaderInjectJs(context: Context): String {
 // The WebView's own surface color, so there is no white flash before the page paints.
 private const val DARK_SURFACE = "#111111"
 private const val LIGHT_SURFACE = "#FFFFFF"
+
+// A long digit/hex path SEGMENT is the wrapped site's session id. The injected JS has its
+// own copies of this rule (redactPath in SITE_TWEAKS_JS, redactIds in NET_TRACE_JS and
+// PERF_TRACE_JS) covering the lines those probes emit; this is the Kotlin one, covering
+// the forwarded page console, which was the one uncovered path — capture A logged the id
+// in the clear 52 times through it.
+private val SESSION_ID_SEGMENT = Regex("/[0-9a-fA-F]{20,}")
+
+// Redacts an id segment out of arbitrary free-form text (msg.message()) -- the wrapped
+// site's own console.log calls, which are NOT necessarily a URL and can legitimately
+// contain a literal '?' or '#' anywhere in the string. Deliberately does NOT strip a
+// query/fragment: doing that here once silently truncated unrelated trailing content
+// with no marker (e.g. "processed 5 items, query was ?x=1, continuing" lost everything
+// from the '?' on). The id itself is still caught: SESSION_ID_SEGMENT anchors on '/' plus
+// 20+ hex chars, and per the spec's own reasoning the session id lives in the path, not
+// the query string, so skipping the query strip loses no redaction coverage.
+internal fun redactSessionIds(text: String?): String {
+    val raw = text ?: return ""
+    return SESSION_ID_SEGMENT.replace(raw, "/<id>")
+}
+
+// Redacts msg.sourceId() -- an actual URL, where a query string can genuinely appear and
+// is safe to discard outright (unlike the free-form case above). Strips query/fragment for
+// defence-in-depth, matching the JS-side redactors this was modelled on (redactPath in
+// SITE_TWEAKS_JS, redactIds in NET_TRACE_JS/PERF_TRACE_JS), which all parse
+// `new URL(...).pathname` first for the same reason. Then delegates to redactSessionIds
+// for the id-segment redaction itself.
+internal fun redactSourceUrl(url: String?): String {
+    val raw = url ?: return ""
+    val withoutQuery = raw.substringBefore('?').substringBefore('#')
+    return redactSessionIds(withoutQuery)
+}
 
 // Per-site tweaks injected on every load: hide elements, kill consent overlays, pin
 // layout. Everything must be IDEMPOTENT (guarded by window.__appTweaks) because it is
@@ -1404,10 +1438,12 @@ private val SITE_TWEAKS_JS = """
         //    low-pass, forward and backward over the buffer). Asking for a 16 kHz context
         //    makes Chromium resample natively, in the audio pipeline, off the main thread.
         //
-        // ONLY the first context is retuned. AudioQueuePlayer constructs one AudioContext
+        // ONLY the capture context is retuned. AudioQueuePlayer constructs one AudioContext
         // per TTS player for PLAYBACK; forcing 16 kHz on those would degrade TTS output.
-        // The capture context is the first the page constructs, which
-        // tools/site-patches-test.mjs asserts.
+        // Which context IS the capture one is decided semantically, by the constructing
+        // call stack (see isCaptureConstruction() below) -- not by construction order.
+        // tools/site-patches-test.mjs asserts that the capture context is still the one
+        // retuned to 16 kHz under this rule.
         function patchAudioContext() {
             if (window.__appAudioPatched) return;
             var Native = window.AudioContext || window.webkitAudioContext;
@@ -1425,6 +1461,33 @@ private val SITE_TWEAKS_JS = """
             var CAPTURE_BUFFER = 4096;
             var live = [];
 
+            // Which context is the CAPTURE one. This used to be "the first one the page
+            // constructs", which is positional, not semantic -- and finding 2c
+            // (docs/superpowers/specs/2026-09-01-device-log-findings.md) measured it
+            // misfiring on the archive/read path, where the page never records and the
+            // first context is therefore always an AudioQueuePlayer TTS context that got
+            // forced to 16 kHz.
+            //
+            // The site constructs the capture context on the first line of its top-level
+            // createAudioContext() (present/index.html:468) and every TTS context in the
+            // AudioQueuePlayer constructor, so the constructing call stack separates them.
+            //
+            // NOT gated on "has getUserMedia been called": createAudioContext() builds the
+            // context BEFORE it calls getUserMedia, so that flag is always false here.
+            //
+            // The stack is tested and thrown away, never logged -- its frame URLs contain
+            // the session id.
+            function isCaptureConstruction() {
+                var stack = null;
+                try { stack = new Error().stack; } catch (e) { stack = null; }
+                if (stack) return /\bcreateAudioContext\b/.test(stack);
+                // A JS engine with no Error.stack: fall back to the old positional rule,
+                // but only on a page that HAS a capture path at all. That keeps the
+                // archive page -- the case that actually broke -- correct either way.
+                return window.__appAllCtxRates.length === 0
+                    && typeof window.createAudioContext === 'function';
+            }
+
             function kick(ctx, why) {
                 if (!ctx || ctx.state !== 'suspended') return;
                 var p = ctx.resume();
@@ -1438,9 +1501,9 @@ private val SITE_TWEAKS_JS = """
             }
 
             var Wrapped = function (options) {
-                var isFirst = (window.__appAllCtxRates.length === 0);
+                var isCapture = isCaptureConstruction();
                 var opts = options;
-                if (isFirst) {
+                if (isCapture) {
                     opts = {};
                     if (options) {
                         for (var k in options) {
@@ -1460,11 +1523,11 @@ private val SITE_TWEAKS_JS = """
                     ctx = new Native(options);
                 }
                 window.__appAllCtxRates.push(ctx.sampleRate);
-                if (isFirst) window.__appCaptureCtx = ctx;
+                if (isCapture) window.__appCaptureCtx = ctx;
                 live.push(ctx);
                 console.log('[app-tweaks] AudioContext ' + window.__appAllCtxRates.length
                     + ' created, state=' + ctx.state + ' rate=' + ctx.sampleRate
-                    + (isFirst ? ' (capture)' : ' (playback)'));
+                    + (isCapture ? ' (capture)' : ' (playback)'));
                 kick(ctx, 'on create');
                 ctx.addEventListener('statechange', function () {
                     console.log('[app-tweaks] AudioContext state -> ' + ctx.state);
@@ -1709,6 +1772,10 @@ private val SITE_TWEAKS_JS = """
             window.__appPrefetched = true;
             var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
             var t0 = performance.now();
+            // Counts what post() actually DID, so the summary cannot report a skip as a
+            // fetch. Capture B logged "15 ok, 0 failed in 0ms" for 15 skips; the 0ms was
+            // the only clue. See the 2026-09-01 findings, finding 2a.
+            var outcomes = { fetched: 0, skipped: 0 };
             var graphUrl = base + '/getgraph';
             // redactPath() so the session id never reaches a log export, exactly as in
             // syncXhrCache. This line is how you tell "the prefetch never ran" apart from
@@ -1729,6 +1796,7 @@ private val SITE_TWEAKS_JS = """
                 // found here is already a good response.
                 var key = cacheKey('POST', url, body);
                 if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    outcomes.skipped++;
                     console.log('[app-tweaks] prefetch ' + label
                         + ' already cached (page won the race), skipping fetch');
                     return Promise.resolve(store[key]);
@@ -1742,6 +1810,7 @@ private val SITE_TWEAKS_JS = """
                     // prefetch never got the chance to try".
                     window.__appPrefetchWon = true;
                 }
+                outcomes.fetched++;
                 var t = performance.now();
                 return fetch(url, {
                     method: 'POST',
@@ -1775,6 +1844,10 @@ private val SITE_TWEAKS_JS = """
                 var graph = JSON.parse(text);
                 var jobs = [];
                 var workers = 0;
+                // Snapshot after getgraph's own post() has counted itself and before any
+                // language job is created, so the numbers below describe the language jobs
+                // alone. getgraph reports its own outcome on its own line.
+                var langBase = { fetched: outcomes.fetched, skipped: outcomes.skipped };
                 for (var worker in graph) {
                     if (!Object.prototype.hasOwnProperty.call(graph, worker)) continue;
                     workers++;
@@ -1801,7 +1874,9 @@ private val SITE_TWEAKS_JS = """
                 return Promise.all(jobs).then(function (results) {
                     var ok = 0;
                     for (var i = 0; i < results.length; i++) if (results[i]) ok++;
-                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok, '
+                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok ('
+                        + (outcomes.fetched - langBase.fetched) + ' fetched, '
+                        + (outcomes.skipped - langBase.skipped) + ' already cached), '
                         + (results.length - ok) + ' failed in '
                         + Math.round(performance.now() - t1) + 'ms, '
                         + Object.keys(store).length + ' keys stored');
@@ -1967,7 +2042,21 @@ class MainActivity : ComponentActivity() {
             Log.i(LOG_TAG, "RECORD_AUDIO granted=$granted")
             val pending = pendingWebPermission
             pendingWebPermission = null
-            if (pending == null) return@registerForActivityResult
+            if (pending == null) {
+                // This launcher is shared between two callers: the startup request in
+                // onCreate (pendingWebPermission null, nothing to grant/deny) and
+                // handleWebAudioPermission's page-triggered request (pendingWebPermission
+                // set). Chained off this result rather than launched beside it: two
+                // launch() calls in one frame can drop one. But that reasoning only holds
+                // for the startup path -- popping a second system dialog for
+                // POST_NOTIFICATIONS is fine before the page has asked for anything, and
+                // wrong the moment it's actually trying to start a recording, since the
+                // notification dialog would sit on top of the page while
+                // pending.grant() lets getUserMedia resolve and capture go live behind it.
+                // So this only runs on the startup path, where pending is null.
+                askForNotificationPermissionIfNeeded()
+                return@registerForActivityResult
+            }
             if (granted) {
                 pending.grant(arrayOf(PermissionRequest.RESOURCE_AUDIO_CAPTURE))
             } else {
@@ -1975,11 +2064,27 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+    // Requested only so the foreground service's ongoing notification is visible. The
+    // service runs either way; nothing is gated on the result, which is why it is not
+    // logged as a failure.
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            Log.i(LOG_TAG, "POST_NOTIFICATIONS granted=$granted")
+        }
+
+    private fun askForNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            == PackageManager.PERMISSION_GRANTED
+        ) return
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Diagnostics first, so the device inventory is logged before any routing decision.
-        micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged)
+        micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged, ::onCaptureSilencedChanged)
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
@@ -2007,6 +2112,9 @@ class MainActivity : ComponentActivity() {
         // own recording UI mid-lecture.
         if (!hasMicPermission()) {
             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        } else {
+            // No RECORD_AUDIO dialog is coming, so nothing to chain off.
+            askForNotificationPermissionIfNeeded()
         }
         setContent {
             AppTheme {
@@ -2024,6 +2132,10 @@ class MainActivity : ComponentActivity() {
                             initialOverride = captureModePreference.override,
                             onOverrideChange = { captureModePreference.override = it },
                         )
+                        CaptureSilencedBanner(
+                            visible = captureSilenced,
+                            modifier = Modifier.align(Alignment.TopCenter),
+                        )
                     }
                 }
             }
@@ -2039,12 +2151,42 @@ class MainActivity : ComponentActivity() {
     private fun onCaptureActiveChanged(active: Boolean) {
         captureActive = active
         setKeepScreenOn(active)
+        when (CaptureServiceControl.next(active, captureServiceRunning)) {
+            CaptureServiceControl.Action.START -> {
+                // start() never throws -- a failure to actually start is reported through
+                // the return value, not an exception, precisely so a transient platform
+                // refusal degrades to today's digital-silence behaviour instead of crashing
+                // the activity and ending the recording outright. Recording the real outcome
+                // here (rather than assuming true) is what lets the next STOP transition
+                // correctly become a no-op instead of stopping a service that isn't running.
+                captureServiceRunning = CaptureForegroundService.start(this)
+            }
+            CaptureServiceControl.Action.STOP -> {
+                CaptureForegroundService.stop(this)
+                captureServiceRunning = false
+            }
+            CaptureServiceControl.Action.NONE -> Unit
+        }
     }
 
-    // A screen that sleeps mid-lecture kills the recording twice over, and silently: the
-    // site auto-mutes on visibilitychange, and Android silences the mic for a backgrounded
-    // app that has no microphone-type foreground service (see CLAUDE.md). Held only while
-    // capture is actually live, so ordinary browsing still lets the screen time out.
+    private var captureServiceRunning = false
+
+    // Mirrors MicDiagnostics' silence signal into Compose. Deliberately NOT dismissible:
+    // this is a live data-loss condition, not a notice, and the whole point is that the
+    // page's own UI keeps looking like a healthy recording while it is true.
+    private var captureSilenced by mutableStateOf(false)
+
+    private fun onCaptureSilencedChanged(silenced: Boolean) {
+        captureSilenced = silenced
+    }
+
+    // A screen that sleeps mid-lecture used to kill the recording silently: Android feeds a
+    // backgrounded app with no microphone-type foreground service digital silence rather
+    // than an error (86.5 s lost on 2026-09-01 — see the device-log findings). The service
+    // above is the fix for that; this flag is still held on top of it, because staying awake
+    // is the right default for a lecture and it also keeps the page's own SSE stream alive.
+    // Held only while capture is actually live, so ordinary browsing still lets the screen
+    // time out.
     private fun setKeepScreenOn(keepOn: Boolean) {
         Log.i(LOG_TAG, "FLAG_KEEP_SCREEN_ON ${if (keepOn) "set" else "cleared"}")
         if (keepOn) {
@@ -2096,9 +2238,44 @@ class MainActivity : ComponentActivity() {
     // Deliberately onDestroy and not onPause: the routing has to survive the screen going
     // off while a lecture is being recorded.
     override fun onDestroy() {
+        // The page lives in this activity's WebView, so once the activity is gone there is
+        // nothing left to record — the exemption must not outlive it.
+        CaptureForegroundService.stop(this)
+        captureServiceRunning = false
         micRouter.detach()
         micDiagnostics.detach()
         super.onDestroy()
+    }
+}
+
+// The one condition the wrapped site cannot show, because it cannot see it: the platform is
+// handing this app zeros and the page's recording UI looks entirely healthy. Full-width,
+// error-coloured and not dismissible. The backgrounding hole that motivated building this
+// (86.5 s lost on 2026-09-01) is now covered by CaptureForegroundService instead — and by
+// definition the banner is off-screen while backgrounded anyway, clearing again the moment
+// the user foregrounds and the silencing ends. What the banner is actually for is the cases
+// the service cannot fix: the OS privacy mic toggle, an incoming call, or another app taking
+// the microphone — all silent to the page, and all needing a human to notice and react while
+// looking at the screen. See docs/superpowers/specs/2026-09-01-device-log-findings.md.
+@Composable
+fun CaptureSilencedBanner(visible: Boolean, modifier: Modifier = Modifier) {
+    if (!visible) return
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.capture_silenced_title),
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Text(
+            text = stringResource(R.string.capture_silenced_body),
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 
@@ -2302,7 +2479,14 @@ fun SiteWebView(
                 // "[INFO:CONSOLE]" logcat lines (returning true suppresses them).
                 webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                        Log.d(LOG_TAG, "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                        // Both halves, not just the source: the page console.logs URLs of
+                        // its own, and a log export is shared off-device. The JS probes
+                        // already redact their own lines, so this is a no-op for those.
+                        Log.d(
+                            LOG_TAG,
+                            "${redactSessionIds(msg.message())} " +
+                                "(${redactSourceUrl(msg.sourceId())}:${msg.lineNumber()})",
+                        )
                         return true
                     }
 

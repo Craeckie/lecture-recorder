@@ -1,4 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Lecture Recorder</string>
+    <string name="capture_channel_name">Recording</string>
+    <string name="capture_notification_title">Lecture recording in progress</string>
+    <string name="capture_notification_text">Keeping the microphone open while the app is in the background.</string>
+    <string name="capture_silenced_title">Microphone is silenced</string>
+    <string name="capture_silenced_body">The system is feeding this app silence. Nothing is being recorded. Check for a phone call, the privacy toggle, or another app using the mic.</string>
 </resources>
