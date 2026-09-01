@@ -11,6 +11,13 @@ import android.os.Looper
 import android.util.Log
 import java.util.concurrent.Executor
 
+// Whether the platform is currently feeding this app silence instead of microphone audio.
+// Pure, so the rule ("any silenced config counts, an empty list does not") is testable on a
+// bare JVM; AudioRecordingConfiguration itself is not constructible in a unit test.
+object CaptureSilence {
+    fun isSilenced(silencedFlags: List<Boolean>): Boolean = silencedFlags.any { it }
+}
+
 // Everything this app logs about the microphone. Kept apart from MicRouter so the routing
 // decision stays readable: MicRouter decides, MicDiagnostics reports.
 class MicDiagnostics(
@@ -20,6 +27,13 @@ class MicDiagnostics(
     // capturing right now" — the page itself never tells us — so this is also what drives
     // FLAG_KEEP_SCREEN_ON in MainActivity.
     private val onCaptureActiveChanged: (Boolean) -> Unit = {},
+    // Called on the main thread whenever the platform starts or stops feeding this app
+    // silence instead of real microphone audio, and only on an actual transition. Android
+    // reports this (isClientSilenced, API 29+) but the page cannot see it and does not
+    // notice: the track stays live and the encoder keeps producing packets, they just carry
+    // zeros. On 2026-09-01 that was 86.5 seconds of a real lecture, invisible until the log
+    // was read afterwards.
+    private val onCaptureSilencedChanged: (Boolean) -> Unit = {},
 ) {
     private val audioManager =
         context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -27,6 +41,7 @@ class MicDiagnostics(
     private var recordingCallback: AudioManager.AudioRecordingCallback? = null
     private var communicationDeviceListener: AudioManager.OnCommunicationDeviceChangedListener? = null
     private var captureActive = false
+    private var captureSilenced = false
 
     companion object {
         // AudioDeviceInfo.TYPE_* names, for the types this app can plausibly see. Unmapped
@@ -97,6 +112,10 @@ class MicDiagnostics(
             captureActive = false
             onCaptureActiveChanged(false)
         }
+        if (captureSilenced) {
+            captureSilenced = false
+            onCaptureSilencedChanged(false)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             communicationDeviceListener?.let { audioManager.removeOnCommunicationDeviceChangedListener(it) }
         }
@@ -123,6 +142,16 @@ class MicDiagnostics(
             captureActive = active
             onCaptureActiveChanged(active)
         }
+        val silencedFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            configs.map { it.isClientSilenced }
+        } else {
+            emptyList()
+        }
+        val silenced = CaptureSilence.isSilenced(silencedFlags)
+        if (silenced != captureSilenced) {
+            captureSilenced = silenced
+            onCaptureSilencedChanged(silenced)
+        }
         if (configs.isEmpty()) {
             // Also the normal end of a recording — read it together with the page console.
             Log.i(LOG_TAG, "Recording stopped (no active capture)")
@@ -132,7 +161,7 @@ class MicDiagnostics(
             val source = describeAudioSource(config.clientAudioSource)
             // AudioRecordingConfiguration.getAudioDevice() is API 29+; minSdk is 26, and this
             // callback fires on any device the first time capture starts, so the call must be
-            // guarded the same way isClientSilenced already is below.
+            // guarded the same way isClientSilenced already is above.
             val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 config.audioDevice?.let(::describe) ?: "device unreported"
             } else {
@@ -144,16 +173,16 @@ class MicDiagnostics(
                 "Recording active: source=$source via $device " +
                     "${format.sampleRate}Hz/${format.channelCount}ch",
             )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && config.isClientSilenced) {
-                // The track stays live and the page notices nothing — this log line is the
-                // only sign that the audio reaching the server is silence.
-                Log.w(LOG_TAG, "Capture is SILENCED by the system (call, privacy toggle, or another app)")
-            }
             if (source != "VOICE_COMMUNICATION") {
                 // See the known limitation in the spec: setCommunicationDevice does not
                 // govern the plain MIC source, so USB routing will be ignored.
                 Log.w(LOG_TAG, "Capture uses $source, not VOICE_COMMUNICATION — USB routing does not apply")
             }
+        }
+        if (silenced) {
+            // The track stays live and the page notices nothing — this log line and the
+            // in-app banner are the only signs that the audio reaching the server is silence.
+            Log.w(LOG_TAG, "Capture is SILENCED by the system (call, privacy toggle, or another app)")
         }
     }
 }

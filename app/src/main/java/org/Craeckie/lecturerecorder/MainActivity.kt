@@ -56,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -2071,7 +2072,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Diagnostics first, so the device inventory is logged before any routing decision.
-        micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged)
+        micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged, ::onCaptureSilencedChanged)
         micDiagnostics.attach()
         micRouter = MicRouter(this)
         micRouter.attach()
@@ -2119,6 +2120,10 @@ class MainActivity : ComponentActivity() {
                             initialOverride = captureModePreference.override,
                             onOverrideChange = { captureModePreference.override = it },
                         )
+                        CaptureSilencedBanner(
+                            visible = captureSilenced,
+                            modifier = Modifier.align(Alignment.TopCenter),
+                        )
                     }
                 }
             }
@@ -2153,6 +2158,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private var captureServiceRunning = false
+
+    // Mirrors MicDiagnostics' silence signal into Compose. Deliberately NOT dismissible:
+    // this is a live data-loss condition, not a notice, and the whole point is that the
+    // page's own UI keeps looking like a healthy recording while it is true.
+    private var captureSilenced by mutableStateOf(false)
+
+    private fun onCaptureSilencedChanged(silenced: Boolean) {
+        captureSilenced = silenced
+    }
 
     // A screen that sleeps mid-lecture used to kill the recording silently: Android feeds a
     // backgrounded app with no microphone-type foreground service digital silence rather
@@ -2219,6 +2233,32 @@ class MainActivity : ComponentActivity() {
         micRouter.detach()
         micDiagnostics.detach()
         super.onDestroy()
+    }
+}
+
+// The one condition the wrapped site cannot show, because it cannot see it: the platform is
+// handing this app zeros and the page's recording UI looks entirely healthy. Full-width,
+// error-coloured and not dismissible — an 87-second hole in a lecture is worth covering a
+// strip of the page for. See docs/superpowers/specs/2026-09-01-device-log-findings.md.
+@Composable
+fun CaptureSilencedBanner(visible: Boolean, modifier: Modifier = Modifier) {
+    if (!visible) return
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.errorContainer)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.capture_silenced_title),
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Text(
+            text = stringResource(R.string.capture_silenced_body),
+            color = MaterialTheme.colorScheme.onErrorContainer,
+            style = MaterialTheme.typography.bodySmall,
+        )
     }
 }
 
