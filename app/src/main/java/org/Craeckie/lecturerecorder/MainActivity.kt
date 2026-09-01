@@ -132,6 +132,20 @@ private fun darkReaderInjectJs(context: Context): String {
 private const val DARK_SURFACE = "#111111"
 private const val LIGHT_SURFACE = "#FFFFFF"
 
+// A long digit/hex path SEGMENT is the wrapped site's session id. The injected JS has its
+// own copies of this rule (redactPath in SITE_TWEAKS_JS, redactIds in NET_TRACE_JS and
+// PERF_TRACE_JS) covering the lines those probes emit; this is the Kotlin one, covering
+// the forwarded page console, which was the one uncovered path — capture A logged the id
+// in the clear 52 times through it. Unlike the JS copies it keeps the origin, because a
+// console line's value is knowing WHICH script spoke, and the host is not the secret.
+private val SESSION_ID_SEGMENT = Regex("/[0-9a-fA-F]{20,}")
+
+internal fun redactSessionIds(text: String?): String {
+    val raw = text ?: return ""
+    val withoutQuery = raw.substringBefore('?').substringBefore('#')
+    return SESSION_ID_SEGMENT.replace(withoutQuery, "/<id>")
+}
+
 // Per-site tweaks injected on every load: hide elements, kill consent overlays, pin
 // layout. Everything must be IDEMPOTENT (guarded by window.__appTweaks) because it is
 // injected from several places — see the injection-timing notes in CLAUDE.md.
@@ -2302,7 +2316,14 @@ fun SiteWebView(
                 // "[INFO:CONSOLE]" logcat lines (returning true suppresses them).
                 webChromeClient = object : WebChromeClient() {
                     override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                        Log.d(LOG_TAG, "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                        // Both halves, not just the source: the page console.logs URLs of
+                        // its own, and a log export is shared off-device. The JS probes
+                        // already redact their own lines, so this is a no-op for those.
+                        Log.d(
+                            LOG_TAG,
+                            "${redactSessionIds(msg.message())} " +
+                                "(${redactSessionIds(msg.sourceId())}:${msg.lineNumber()})",
+                        )
                         return true
                     }
 
