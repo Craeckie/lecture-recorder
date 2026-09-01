@@ -1741,6 +1741,10 @@ private val SITE_TWEAKS_JS = """
             window.__appPrefetched = true;
             var store = window.__appSyncXhrStore = window.__appSyncXhrStore || {};
             var t0 = performance.now();
+            // Counts what post() actually DID, so the summary cannot report a skip as a
+            // fetch. Capture B logged "15 ok, 0 failed in 0ms" for 15 skips; the 0ms was
+            // the only clue. See the 2026-09-01 findings, finding 2a.
+            var outcomes = { fetched: 0, skipped: 0 };
             var graphUrl = base + '/getgraph';
             // redactPath() so the session id never reaches a log export, exactly as in
             // syncXhrCache. This line is how you tell "the prefetch never ran" apart from
@@ -1761,6 +1765,7 @@ private val SITE_TWEAKS_JS = """
                 // found here is already a good response.
                 var key = cacheKey('POST', url, body);
                 if (Object.prototype.hasOwnProperty.call(store, key)) {
+                    outcomes.skipped++;
                     console.log('[app-tweaks] prefetch ' + label
                         + ' already cached (page won the race), skipping fetch');
                     return Promise.resolve(store[key]);
@@ -1774,6 +1779,7 @@ private val SITE_TWEAKS_JS = """
                     // prefetch never got the chance to try".
                     window.__appPrefetchWon = true;
                 }
+                outcomes.fetched++;
                 var t = performance.now();
                 return fetch(url, {
                     method: 'POST',
@@ -1807,6 +1813,10 @@ private val SITE_TWEAKS_JS = """
                 var graph = JSON.parse(text);
                 var jobs = [];
                 var workers = 0;
+                // Snapshot after getgraph's own post() has counted itself and before any
+                // language job is created, so the numbers below describe the language jobs
+                // alone. getgraph reports its own outcome on its own line.
+                var langBase = { fetched: outcomes.fetched, skipped: outcomes.skipped };
                 for (var worker in graph) {
                     if (!Object.prototype.hasOwnProperty.call(graph, worker)) continue;
                     workers++;
@@ -1833,7 +1843,9 @@ private val SITE_TWEAKS_JS = """
                 return Promise.all(jobs).then(function (results) {
                     var ok = 0;
                     for (var i = 0; i < results.length; i++) if (results[i]) ok++;
-                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok, '
+                    console.log('[app-tweaks] prefetch done: ' + ok + ' ok ('
+                        + (outcomes.fetched - langBase.fetched) + ' fetched, '
+                        + (outcomes.skipped - langBase.skipped) + ' already cached), '
                         + (results.length - ok) + ' failed in '
                         + Math.round(performance.now() - t1) + 'ms, '
                         + Object.keys(store).length + ' keys stored');
