@@ -136,14 +136,32 @@ private const val LIGHT_SURFACE = "#FFFFFF"
 // own copies of this rule (redactPath in SITE_TWEAKS_JS, redactIds in NET_TRACE_JS and
 // PERF_TRACE_JS) covering the lines those probes emit; this is the Kotlin one, covering
 // the forwarded page console, which was the one uncovered path — capture A logged the id
-// in the clear 52 times through it. Unlike the JS copies it keeps the origin, because a
-// console line's value is knowing WHICH script spoke, and the host is not the secret.
+// in the clear 52 times through it.
 private val SESSION_ID_SEGMENT = Regex("/[0-9a-fA-F]{20,}")
 
+// Redacts an id segment out of arbitrary free-form text (msg.message()) -- the wrapped
+// site's own console.log calls, which are NOT necessarily a URL and can legitimately
+// contain a literal '?' or '#' anywhere in the string. Deliberately does NOT strip a
+// query/fragment: doing that here once silently truncated unrelated trailing content
+// with no marker (e.g. "processed 5 items, query was ?x=1, continuing" lost everything
+// from the '?' on). The id itself is still caught: SESSION_ID_SEGMENT anchors on '/' plus
+// 20+ hex chars, and per the spec's own reasoning the session id lives in the path, not
+// the query string, so skipping the query strip loses no redaction coverage.
 internal fun redactSessionIds(text: String?): String {
     val raw = text ?: return ""
+    return SESSION_ID_SEGMENT.replace(raw, "/<id>")
+}
+
+// Redacts msg.sourceId() -- an actual URL, where a query string can genuinely appear and
+// is safe to discard outright (unlike the free-form case above). Strips query/fragment for
+// defence-in-depth, matching the JS-side redactors this was modelled on (redactPath in
+// SITE_TWEAKS_JS, redactIds in NET_TRACE_JS/PERF_TRACE_JS), which all parse
+// `new URL(...).pathname` first for the same reason. Then delegates to redactSessionIds
+// for the id-segment redaction itself.
+internal fun redactSourceUrl(url: String?): String {
+    val raw = url ?: return ""
     val withoutQuery = raw.substringBefore('?').substringBefore('#')
-    return SESSION_ID_SEGMENT.replace(withoutQuery, "/<id>")
+    return redactSessionIds(withoutQuery)
 }
 
 // Per-site tweaks injected on every load: hide elements, kill consent overlays, pin
@@ -2322,7 +2340,7 @@ fun SiteWebView(
                         Log.d(
                             LOG_TAG,
                             "${redactSessionIds(msg.message())} " +
-                                "(${redactSessionIds(msg.sourceId())}:${msg.lineNumber()})",
+                                "(${redactSourceUrl(msg.sourceId())}:${msg.lineNumber()})",
                         )
                         return true
                     }
