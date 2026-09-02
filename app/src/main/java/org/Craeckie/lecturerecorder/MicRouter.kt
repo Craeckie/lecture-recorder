@@ -40,6 +40,36 @@ object MicRouting {
         deviceTypes.indexOfFirst { isUsbCommunicationType(it) }.takeIf { it >= 0 }
 }
 
+// Whether a routing change may be applied right now, given whether a USB communication
+// device is available and whether the page is currently recording. Split out of MicRouter
+// for the same reason MicRouting is: this is the part with a rule in it, and the only part
+// a bare JVM can test.
+//
+// Selecting a communication device moves the OUTPUT route, and Chromium's WebAudio output
+// stream cannot follow that mid-recording. Measured on device 2026-09-02: plugging the
+// KM_B2 in during a live lecture timed the AAudio stream out after 1 s, errored the page's
+// AudioContext into `suspended`, and cost 6.0 s of audio -- one whole `[perf]` rollup at
+// `cb=0`, recovered only because patchAudioContext() resumes on `statechange`.
+//
+// And it cannot help even when it works: the capture mode and the microphone are both
+// fixed at getUserMedia time, so a device that arrives after the record button was pressed
+// is unreachable for that session. Across three USB attach/detach events in that same log
+// the platform never once reported a recording-configuration change -- capture stayed on
+// the built-in mic throughout. So there is nothing to trade off: a deferred SELECT loses
+// nothing and is replayed when capture stops, in time for the next getUserMedia.
+//
+// A CLEAR is NOT deferred. There the device is physically gone, the platform has already
+// fallen back on its own, and both unplugs in that log cost nothing measurable.
+object MicRoutingGate {
+    enum class Action { SELECT, CLEAR, DEFER }
+
+    fun next(usbAvailable: Boolean, captureActive: Boolean): Action = when {
+        !usbAvailable -> Action.CLEAR
+        captureActive -> Action.DEFER
+        else -> Action.SELECT
+    }
+}
+
 // Routes microphone capture to an attached USB input, so the wrapped page's getUserMedia
 // call records from it instead of the built-in mic. See CLAUDE.md and
 // docs/superpowers/specs/2026-08-29-usb-mic-routing-design.md for why this has to happen
@@ -48,6 +78,15 @@ class MicRouter(context: Context) {
     private val audioManager =
         context.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var deviceCallback: AudioDeviceCallback? = null
+
+    // Mirrored from MicDiagnostics through MainActivity.onCaptureActiveChanged -- the
+    // shell's only knowledge that the page is recording. See MicRoutingGate for why the
+    // router needs it.
+    private var captureActive = false
+
+    // A USB device showed up mid-recording and its selection was skipped. Replayed the
+    // moment capture stops, so the next getUserMedia sees the device.
+    private var pendingRouting = false
 
     // Call before the WebView is created, so the device is selected before the page can
     // call getUserMedia. Registering the callback immediately reports the currently
@@ -70,10 +109,36 @@ class MicRouter(context: Context) {
     fun detach() {
         val callback = deviceCallback ?: return
         deviceCallback = null
+        // MainActivity detaches the router before the diagnostics, and MicDiagnostics.detach()
+        // reports capture as ended -- which lands back here in setCaptureActive(false). Drop
+        // the queue so that call cannot re-select a device on the way out, right after the
+        // clearCommunicationDevice() below.
+        pendingRouting = false
         audioManager.unregisterAudioDeviceCallback(callback)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.clearCommunicationDevice()
         }
+    }
+
+    // Told to the router by MainActivity, off MicDiagnostics' capture signal -- the same
+    // one that drives FLAG_KEEP_SCREEN_ON, the back confirmation and the foreground
+    // service, so none of the four can disagree about whether capture is live.
+    //
+    // Only transitions do anything, and only the falling edge does work: a routing change
+    // skipped during the recording is applied here instead, which is early enough for the
+    // next getUserMedia and late enough to leave the live AudioContext alone.
+    fun setCaptureActive(active: Boolean) {
+        if (active == captureActive) return
+        captureActive = active
+        if (active || !pendingRouting) return
+        // Null before attach(), after detach(), and on API < 31 where attach() returns
+        // early and there is no routing to apply at all. The explicit SDK_INT check is
+        // still there for lint, which cannot see that implication.
+        if (deviceCallback == null) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        pendingRouting = false
+        Log.i(LOG_TAG, "Capture stopped; applying the USB routing deferred during the recording")
+        applyRouting()
     }
 
     // Whether capture routed to the communication path would currently land on a USB
@@ -109,19 +174,40 @@ class MicRouter(context: Context) {
     @RequiresApi(Build.VERSION_CODES.S)
     private fun applyRouting() {
         val devices = audioManager.availableCommunicationDevices
-        val index = MicRouting.pickPreferredDeviceIndex(devices.map { it.type })
-        if (index == null) {
-            if (audioManager.communicationDevice != null) {
-                audioManager.clearCommunicationDevice()
+        val device = MicRouting.pickPreferredDeviceIndex(devices.map { it.type })?.let { devices[it] }
+        when (MicRoutingGate.next(usbAvailable = device != null, captureActive = captureActive)) {
+            MicRoutingGate.Action.CLEAR -> {
+                // The device is gone, so a queued selection for it is gone with it.
+                pendingRouting = false
+                if (audioManager.communicationDevice != null) {
+                    audioManager.clearCommunicationDevice()
+                }
+                Log.i(
+                    LOG_TAG,
+                    "No USB communication device among ${devices.size} communication devices " +
+                        "(${devices.joinToString { MicDiagnostics.describeDeviceType(it.type) }}); using system default",
+                )
             }
-            Log.i(
-                LOG_TAG,
-                "No USB communication device among ${devices.size} communication devices " +
-                    "(${devices.joinToString { MicDiagnostics.describeDeviceType(it.type) }}); using system default",
-            )
-            return
+            MicRoutingGate.Action.DEFER -> {
+                pendingRouting = true
+                Log.i(
+                    LOG_TAG,
+                    "USB device attached during a live recording; routing deferred until it ends. " +
+                        "This recording keeps the microphone it started with — attach the USB " +
+                        "device BEFORE pressing record for it to be used",
+                )
+            }
+            MicRoutingGate.Action.SELECT -> {
+                pendingRouting = false
+                // The gate only returns SELECT when usbAvailable was true, so this is a
+                // null check for the compiler's benefit rather than a reachable branch.
+                if (device != null) select(device)
+            }
         }
-        val device = devices[index]
+    }
+
+    @RequiresApi(Build.VERSION_CODES.S)
+    private fun select(device: AudioDeviceInfo) {
         val applied = try {
             audioManager.setCommunicationDevice(device)
         } catch (e: IllegalArgumentException) {

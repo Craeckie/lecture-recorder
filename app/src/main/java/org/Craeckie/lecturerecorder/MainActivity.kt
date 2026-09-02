@@ -2084,9 +2084,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         // Diagnostics first, so the device inventory is logged before any routing decision.
+        // The router is CONSTRUCTED before the diagnostics are attached, though, because
+        // onCaptureActiveChanged now forwards into it and that callback can fire as soon as
+        // the recording callback is registered -- a lateinit crash there would end the
+        // recording, which is the worst failure this app has (pitfall #9).
         micDiagnostics = MicDiagnostics(this, ::onCaptureActiveChanged, ::onCaptureSilencedChanged)
-        micDiagnostics.attach()
         micRouter = MicRouter(this)
+        micDiagnostics.attach()
         micRouter.attach()
         captureModePreference = CaptureModePreference(this)
         // Debug builds only. `adb shell am start -n org.Craeckie.lecturerecorder/.MainActivity
@@ -2151,6 +2155,10 @@ class MainActivity : ComponentActivity() {
     private fun onCaptureActiveChanged(active: Boolean) {
         captureActive = active
         setKeepScreenOn(active)
+        // Suppresses setCommunicationDevice() while the page is recording: that call moves
+        // the output route, which kills the live AudioContext -- 6.0 s of audio, measured
+        // 2026-09-02 -- and cannot move capture anyway. See MicRoutingGate.
+        micRouter.setCaptureActive(active)
         when (CaptureServiceControl.next(active, captureServiceRunning)) {
             CaptureServiceControl.Action.START -> {
                 // start() never throws -- a failure to actually start is reported through
