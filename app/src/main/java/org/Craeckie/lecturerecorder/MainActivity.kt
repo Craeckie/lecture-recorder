@@ -29,8 +29,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,6 +44,7 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -60,6 +63,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import java.text.DateFormat
+import java.util.Date
 import org.Craeckie.lecturerecorder.ui.theme.AppTheme
 
 // The site this app wraps. See CLAUDE.md for everything worth knowing about wrapping a
@@ -2019,12 +2024,27 @@ private fun isNightMode(context: Context): Boolean =
 
 // The manifest's VIEW intent-filter matches the whole lt2srv.iar.kit.edu host (short
 // links, /present/<id>, ...), but only a VIEW intent actually carries a link to open --
-// the launcher MAIN intent has no data at all. Anything else falls back to SITE_URL.
-private fun launchUrl(intent: Intent?): String {
-    val data = intent?.data ?: return SITE_URL
-    if (data.scheme != "http" && data.scheme != "https") return SITE_URL
-    if (data.host != Uri.parse(SITE_URL).host) return SITE_URL
+// the launcher MAIN intent has no data at all, and that (not a match failure) is what
+// sends it to the start screen instead of straight into the site.
+private fun matchedViewUrl(intent: Intent?): String? {
+    val data = intent?.data ?: return null
+    if (data.scheme != "http" && data.scheme != "https") return null
+    if (data.host != Uri.parse(SITE_URL).host) return null
     return data.toString()
+}
+
+// The two things setContent shows: the remembered-sessions start screen, or the wrapped
+// site loaded at a particular URL.
+private sealed class Screen {
+    data object List : Screen()
+    data class Site(val url: String) : Screen()
+}
+
+// What SiteWebView's "recording in progress" confirmation is guarding: either path (back,
+// or a session pick from the SESSIONS chip) ends the live recording once confirmed.
+private sealed class PendingLeaveAction {
+    data object Leave : PendingLeaveAction()
+    data class OpenSession(val name: String) : PendingLeaveAction()
 }
 
 class MainActivity : ComponentActivity() {
@@ -2032,6 +2052,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var micDiagnostics: MicDiagnostics
     private lateinit var micBridge: MicBridge
     private lateinit var captureModePreference: CaptureModePreference
+    private lateinit var sessionLinkStore: SessionShortLinkStore
 
     // Held while the OS permission dialog is up, so the page's own permission request can
     // be answered once the user has decided. Null at all other times.
@@ -2093,6 +2114,14 @@ class MainActivity : ComponentActivity() {
         micDiagnostics.attach()
         micRouter.attach()
         captureModePreference = CaptureModePreference(this)
+        sessionLinkStore = SessionShortLinkStore(this)
+        // A VIEW intent's URL is remembered up front, same as one picked from the list or
+        // navigated to in-page -- see SiteWebView's onSessionUrlLoaded for the other two
+        // collection points.
+        val viewUrl = matchedViewUrl(intent)
+        if (viewUrl != null) {
+            SessionShortLinks.nameFrom(viewUrl)?.let { sessionLinkStore.remember(it) }
+        }
         // Debug builds only. `adb shell am start -n org.Craeckie.lecturerecorder/.MainActivity
         // --es micmode voice` pins the capture mode for the A/B/C probe in Task 4 of
         // docs/superpowers/plans/2026-08-30-capture-mode-resolution.md. Release builds
@@ -2122,24 +2151,55 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             AppTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    Box(modifier = Modifier.padding(innerPadding)) {
-                        SiteWebView(
-                            startUrl = launchUrl(intent),
-                            onAudioPermissionRequest = ::handleWebAudioPermission,
-                            micBridge = micBridge,
-                            captureActive = captureActive,
-                            onExitApp = ::finish,
+                var screen by remember {
+                    mutableStateOf<Screen>(if (viewUrl != null) Screen.Site(viewUrl) else Screen.List)
+                }
+                var sessionEntries by remember { mutableStateOf(sessionLinkStore.load()) }
+
+                fun rememberSession(name: String) {
+                    sessionEntries = sessionLinkStore.remember(name)
+                }
+
+                fun removeSession(name: String) {
+                    sessionEntries = sessionLinkStore.removeAll(setOf(name))
+                }
+
+                when (val current = screen) {
+                    Screen.List -> {
+                        StartScreen(
+                            entries = sessionEntries,
+                            onOpen = { name -> screen = Screen.Site(SessionShortLinks.urlFor(name)) },
+                            onRemove = ::removeSession,
+                            onAdd = ::rememberSession,
+                            onOpenSite = { screen = Screen.Site(SITE_URL) },
                         )
-                        CaptureModeSelector(
-                            modifier = Modifier.align(Alignment.BottomStart),
-                            initialOverride = captureModePreference.override,
-                            onOverrideChange = { captureModePreference.override = it },
-                        )
-                        CaptureSilencedBanner(
-                            visible = captureSilenced,
-                            modifier = Modifier.align(Alignment.TopCenter),
-                        )
+                    }
+                    is Screen.Site -> {
+                        Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+                            Box(modifier = Modifier.padding(innerPadding)) {
+                                SiteWebView(
+                                    startUrl = current.url,
+                                    onAudioPermissionRequest = ::handleWebAudioPermission,
+                                    micBridge = micBridge,
+                                    captureActive = captureActive,
+                                    onLeaveSite = { screen = Screen.List },
+                                    sessionEntries = sessionEntries,
+                                    onSessionUrlLoaded = ::rememberSession,
+                                    onRemoveSession = ::removeSession,
+                                    onAddSession = ::rememberSession,
+                                    sessionsChipModifier = Modifier.align(Alignment.BottomEnd),
+                                )
+                                CaptureModeSelector(
+                                    modifier = Modifier.align(Alignment.BottomStart),
+                                    initialOverride = captureModePreference.override,
+                                    onOverrideChange = { captureModePreference.override = it },
+                                )
+                                CaptureSilencedBanner(
+                                    visible = captureSilenced,
+                                    modifier = Modifier.align(Alignment.TopCenter),
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -2366,6 +2426,199 @@ private val CAPTURE_MODE_CHOICES: List<Pair<String?, String>> = listOf(
     CaptureModes.HYBRID to "hybrid — USB routing, no NS/AGC",
 )
 
+// The list of remembered sessions, shown two ways: full-screen before the WebView exists
+// (StartScreen below) and inside a dialog from the in-site chip (SessionListChip below).
+// Long-press to remove mirrors a common Android list convention; there is no swipe-to-
+// dismiss elsewhere in this app to be consistent with instead.
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun SessionList(
+    entries: List<SessionShortLink>,
+    onOpen: (String) -> Unit,
+    onRemove: (String) -> Unit,
+    onAdd: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    onOpenSite: (() -> Unit)? = null,
+) {
+    var removing by remember { mutableStateOf<String?>(null) }
+    var adding by remember { mutableStateOf(false) }
+    val dateFormat = remember { DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT) }
+
+    Column(modifier = modifier) {
+        entries.sortedByDescending { it.lastOpened }.forEach { entry ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .combinedClickable(
+                        onClick = { onOpen(entry.name) },
+                        onLongClick = { removing = entry.name },
+                    )
+                    .padding(vertical = 12.dp),
+            ) {
+                Column {
+                    Text(entry.name, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        dateFormat.format(Date(entry.lastOpened)),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { adding = true }
+                .padding(vertical = 12.dp),
+        ) {
+            Text("+ Add session", style = MaterialTheme.typography.bodyLarge)
+        }
+        if (onOpenSite != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onOpenSite)
+                    .padding(vertical = 12.dp),
+            ) {
+                Text(
+                    "Open lt2srv.iar.kit.edu",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+    }
+
+    if (removing != null) {
+        val name = removing!!
+        AlertDialog(
+            onDismissRequest = { removing = null },
+            title = { Text("Remove session?") },
+            text = { Text("Removes \"$name\" from this list. Nothing changes on the server.") },
+            confirmButton = {
+                TextButton(onClick = { onRemove(name); removing = null }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { removing = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (adding) {
+        var text by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { adding = false },
+            title = { Text("Add session") },
+            text = {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    placeholder = { Text("Shorten link or session name") },
+                    singleLine = true,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    SessionShortLinks.nameFrom(text)?.let(onAdd)
+                    adding = false
+                }) { Text("Add") }
+            },
+            dismissButton = {
+                TextButton(onClick = { adding = false }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+// Shown before the WebView exists at all: the launcher MAIN intent's destination. A VIEW
+// intent (a QR scan, a tapped shorten link) skips this screen entirely -- see
+// matchedViewUrl -- so this is reached only by explicitly launching the app icon.
+@Composable
+fun StartScreen(
+    entries: List<SessionShortLink>,
+    onOpen: (String) -> Unit,
+    onRemove: (String) -> Unit,
+    onAdd: (String) -> Unit,
+    onOpenSite: () -> Unit,
+) {
+    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(16.dp),
+        ) {
+            Text(
+                stringResource(R.string.app_name),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.padding(bottom = 16.dp),
+            )
+            if (entries.isEmpty()) {
+                Text(
+                    "No remembered sessions yet.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp),
+                )
+            }
+            SessionList(
+                entries = entries,
+                onOpen = onOpen,
+                onRemove = onRemove,
+                onAdd = onAdd,
+                onOpenSite = onOpenSite,
+            )
+        }
+    }
+}
+
+// The in-site counterpart of the start screen: a tiny chip mirroring CaptureModeSelector's
+// bottom-left one (same size/alpha/shape), bottom-right so the two never overlap. Opens the
+// same SessionList in a dialog; onOpen there is wired by the caller (SiteWebView) to
+// navigate the EXISTING WebView rather than recreate it -- a fresh WebView would drop a
+// live recording.
+@Composable
+fun SessionListChip(
+    entries: List<SessionShortLink>,
+    onOpen: (String) -> Unit,
+    onRemove: (String) -> Unit,
+    onAdd: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var showing by remember { mutableStateOf(false) }
+
+    Text(
+        text = "SESSIONS",
+        fontSize = 9.sp,
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = modifier
+            .padding(4.dp)
+            .alpha(0.35f)
+            .background(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(4.dp),
+            )
+            .clickable { showing = true }
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+    )
+
+    if (!showing) return
+    AlertDialog(
+        onDismissRequest = { showing = false },
+        title = { Text("Sessions") },
+        text = {
+            SessionList(
+                entries = entries,
+                onOpen = { name -> showing = false; onOpen(name) },
+                onRemove = onRemove,
+                onAdd = onAdd,
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { showing = false }) { Text("Close") }
+        },
+    )
+}
+
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun SiteWebView(
@@ -2374,34 +2627,58 @@ fun SiteWebView(
     onAudioPermissionRequest: (PermissionRequest) -> Unit,
     micBridge: MicBridge,
     captureActive: Boolean = false,
-    onExitApp: () -> Unit = {},
+    onLeaveSite: () -> Unit = {},
+    sessionEntries: List<SessionShortLink> = emptyList(),
+    onSessionUrlLoaded: (String) -> Unit = {},
+    onRemoveSession: (String) -> Unit = {},
+    onAddSession: (String) -> Unit = {},
+    sessionsChipModifier: Modifier = Modifier,
 ) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
     // into a State explicitly (updated on every navigation) for BackHandler to react
     // to in-page navigation instead of latching to the value from first composition.
     var canGoBack by remember { mutableStateOf(false) }
-    var confirmingLeave by remember { mutableStateOf(false) }
+    // Both back (with live capture) and a session pick from the SESSIONS chip need the
+    // same "recording in progress" confirmation before navigating away -- picking a
+    // session mid-recording ends the current one exactly as leaving does. One pending
+    // action covers both instead of duplicating the dialog.
+    var pendingLeaveAction by remember { mutableStateOf<PendingLeaveAction?>(null) }
 
     // Leaving the recording page is destructive and irreversible: the site POSTs
     // /delete_session/<id> as the page unloads, so the session and its transcript are gone
     // -- no history entry brings them back. Both back paths do it, which is why this
-    // intercepts BOTH: goBack() when there is history, and finishing the activity when
-    // there is not (the default when BackHandler is disabled).
+    // intercepts BOTH: goBack() when there is history, and returning to the start screen
+    // when there is not (the default when BackHandler is disabled).
     fun leave() {
-        if (canGoBack) webView?.goBack() else onExitApp()
+        if (canGoBack) webView?.goBack() else onLeaveSite()
+    }
+
+    // Navigates the EXISTING WebView to a different session -- never a new WebView, which
+    // would drop a live recording (pitfall #9's whole point). Goes through the same
+    // confirmation as back while capture is live, since navigating away ends the session
+    // either way.
+    fun openSession(name: String) {
+        if (captureActive) {
+            pendingLeaveAction = PendingLeaveAction.OpenSession(name)
+        } else {
+            Log.i(LOG_TAG, "Opening remembered session '$name' in place")
+            webView?.loadUrl(SessionShortLinks.urlFor(name))
+            onSessionUrlLoaded(name)
+        }
     }
 
     // Enabled whenever back would do something destructive OR navigable. While capture is
     // live it always asks first; otherwise back keeps walking the WebView history exactly
     // as before, and falls through to the system when there is none.
     BackHandler(enabled = captureActive || canGoBack) {
-        if (captureActive) confirmingLeave = true else leave()
+        if (captureActive) pendingLeaveAction = PendingLeaveAction.Leave else leave()
     }
 
-    if (confirmingLeave) {
+    if (pendingLeaveAction != null) {
+        val action = pendingLeaveAction!!
         AlertDialog(
-            onDismissRequest = { confirmingLeave = false },
+            onDismissRequest = { pendingLeaveAction = null },
             title = { Text("Recording in progress") },
             text = {
                 Text(
@@ -2411,13 +2688,19 @@ fun SiteWebView(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    confirmingLeave = false
+                    pendingLeaveAction = null
                     Log.i(LOG_TAG, "Leaving a live recording, confirmed by the user")
-                    leave()
+                    when (action) {
+                        is PendingLeaveAction.Leave -> leave()
+                        is PendingLeaveAction.OpenSession -> {
+                            webView?.loadUrl(SessionShortLinks.urlFor(action.name))
+                            onSessionUrlLoaded(action.name)
+                        }
+                    }
                 }) { Text("Discard and leave") }
             },
             dismissButton = {
-                TextButton(onClick = { confirmingLeave = false }) { Text("Keep recording") }
+                TextButton(onClick = { pendingLeaveAction = null }) { Text("Keep recording") }
             },
         )
     }
@@ -2514,7 +2797,13 @@ fun SiteWebView(
                         request: WebResourceRequest,
                     ): Boolean {
                         val url = request.url
-                        if (url.scheme == "http" || url.scheme == "https") return false
+                        if (url.scheme == "http" || url.scheme == "https") {
+                            // Covers taps and redirects; the other two collection points
+                            // are the initial loadUrl(startUrl) below and a pick from the
+                            // SESSIONS chip (openSession, above).
+                            SessionShortLinks.nameFrom(url.toString())?.let(onSessionUrlLoaded)
+                            return false
+                        }
                         // Non-http(s) links (mailto:, tel:, intent:, ...) can't be
                         // loaded by the WebView itself; hand them to the system.
                         return try {
@@ -2588,6 +2877,7 @@ fun SiteWebView(
                         canGoBack = view.canGoBack()
                     }
                 }
+                SessionShortLinks.nameFrom(startUrl)?.let(onSessionUrlLoaded)
                 loadUrl(startUrl)
                 webView = this
             }
@@ -2596,5 +2886,13 @@ fun SiteWebView(
             webView?.destroy()
             webView = null
         },
+    )
+
+    SessionListChip(
+        entries = sessionEntries,
+        onOpen = ::openSession,
+        onRemove = onRemoveSession,
+        onAdd = onAddSession,
+        modifier = sessionsChipModifier,
     )
 }
