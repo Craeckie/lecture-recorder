@@ -1,0 +1,59 @@
+# Lecture Recorder
+
+An unofficial Android app that wraps [KIT's live-transcription site](https://lt2srv.iar.kit.edu/)
+in a `WebView` and keeps it recording reliably in the background.
+
+**Not affiliated with or endorsed by KIT.** This is a personal project, built to fix
+problems the plain mobile browser has with that site during a live lecture:
+
+- **Keeps the microphone alive in the background.** Since Android 9, a backgrounded app
+  with no microphone-type foreground service is fed digital silence instead of real audio
+  or an error — silently. This app runs a foreground service while a recording is live so
+  the mic keeps working when you switch apps or lock the screen.
+- **Survives rotation and day/night switches.** The site ends the recording session when
+  the page unloads, so anything that reloads the `WebView` (a rotation, a system theme
+  change) would silently kill a live recording. The activity is configured to survive
+  those instead of recreating the page.
+- **Remembers session short links.** Every `/webapi/shorten/<name>` short link the page
+  loads (via tap, redirect, initial load, or a shared QR code) is collected into a start
+  screen, so you can jump back into a session without hunting for the link again.
+- Dark theme in night mode (via [Dark Reader](https://github.com/darkreader/darkreader)),
+  an in-app error page with auto-retry, and the page console forwarded to `logcat` for
+  debugging.
+
+## Building
+
+Requires JDK 17 and the Android SDK (`compileSdk`/`targetSdk` 35, `minSdk` 26).
+
+```sh
+./gradlew testReleaseUnitTest
+./gradlew assembleRelease
+```
+
+CI (`.github/workflows/build.yml`) runs the same two steps on every push and uploads the
+unsigned release APK as a build artifact.
+
+## Signing a release build
+
+There is no signing key in this repository or its CI — releases are unsigned. To install a
+signed build on your own device, sign it with your own key:
+
+```sh
+scripts/release.sh <keystore-password>
+```
+
+By default this looks for a keystore two directories up (`../../my-debug.jks`, alias
+`my-key`); point it at your own instead with the `KEYSTORE` and `KEY_ALIAS` environment
+variables:
+
+```sh
+KEYSTORE=/path/to/your.jks KEY_ALIAS=your-alias scripts/release.sh <keystore-password>
+```
+
+Or sign `app/build/outputs/apk/debug/app-debug.apk` (from `./gradlew assembleDebug`)
+however you prefer — `apksigner`, Android Studio, etc.
+
+## License
+
+MIT — see [LICENSE](LICENSE). `Dark Reader` code vendored under `app/src/main/assets/`
+ships under its own MIT license.
