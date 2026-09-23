@@ -37,6 +37,11 @@ those secrets) it falls back to `app-release-unsigned`. The signing key alias de
 `my-key` and the key password to the store password (a local Gradle build can override
 either with the `KEY_ALIAS`/`KEY_PASSWORD` environment variables).
 
+Releases happen by version bump: raise `versionName` and `versionCode` in
+`app/build.gradle.kts` and push to `master`. `.github/workflows/release.yml` then tags
+`v<versionName>` and publishes a GitHub release with the signed
+`lecture-recorder-v<versionName>.apk`. No tags are pushed by hand.
+
 ## Signing a release build
 
 If you don't have access to the CI-signed `app-release-signed` artifact — e.g. building
