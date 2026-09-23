@@ -31,9 +31,11 @@ Requires JDK 17 and the Android SDK (`compileSdk`/`targetSdk` 35, `minSdk` 26).
 ```
 
 CI (`.github/workflows/build.yml`) runs the same two steps on every push. If the repo has
-`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` and `KEY_PASSWORD` configured as
-secrets, it uploads a signed release APK as the `app-release-signed` build artifact;
-otherwise (e.g. on a fork without those secrets) it falls back to `app-release-unsigned`.
+`KEYSTORE_BASE64` and `KEYSTORE_PASSWORD` configured as secrets, it uploads a signed
+release APK as the `app-release-signed` build artifact; otherwise (e.g. on a fork without
+those secrets) it falls back to `app-release-unsigned`. The signing key alias defaults to
+`my-key` and the key password defaults to the store password; set `KEY_ALIAS` and/or
+`KEY_PASSWORD` as additional secrets to override either one.
 
 ## Signing a release build
 

@@ -7,21 +7,15 @@ plugins {
 }
 
 // Set by CI from repo secrets; absent for every local build, where release stays unsigned
-// exactly as scripts/release.sh (which signs the debug APK separately) expects. Signing is
-// enabled only when ALL FOUR are present -- a partially-configured secret set (e.g. only the
-// keystore itself, not yet the alias/password) must fall back to unsigned, not hand
-// PackageAndroidArtifact an empty alias and fail the whole build.
-val ciSigningEnv = mapOf(
-    "KEYSTORE_BASE64" to System.getenv("KEYSTORE_BASE64"),
-    "KEYSTORE_PASSWORD" to System.getenv("KEYSTORE_PASSWORD"),
-    "KEY_ALIAS" to System.getenv("KEY_ALIAS"),
-    "KEY_PASSWORD" to System.getenv("KEY_PASSWORD"),
-)
-val hasCiSigning = ciSigningEnv.values.all { !it.isNullOrBlank() }
-if (ciSigningEnv.values.any { !it.isNullOrBlank() } && !hasCiSigning) {
-    val missing = ciSigningEnv.filterValues { it.isNullOrBlank() }.keys
-    logger.warn("CI signing secrets partially configured, staying unsigned. Missing: $missing")
-}
+// exactly as scripts/release.sh (which signs the debug APK separately) expects.
+// KEYSTORE_BASE64/KEYSTORE_PASSWORD are the two actually required; KEY_ALIAS/KEY_PASSWORD
+// fall back to this workspace's shared-keystore convention (templates/README.md#local-release--signing-android)
+// when not set as their own secrets -- alias "my-key", key password same as the store password.
+val ciKeystoreBase64: String? = System.getenv("KEYSTORE_BASE64")
+val ciKeystorePassword: String? = System.getenv("KEYSTORE_PASSWORD")
+val hasCiSigning = !ciKeystoreBase64.isNullOrBlank() && !ciKeystorePassword.isNullOrBlank()
+val ciKeyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "my-key"
+val ciKeyPassword = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: ciKeystorePassword
 
 android {
     namespace = "org.Craeckie.lecturerecorder"
@@ -42,11 +36,11 @@ android {
             create("release") {
                 val keystoreFile = layout.buildDirectory.file("ci-release.jks").get().asFile
                 keystoreFile.parentFile.mkdirs()
-                keystoreFile.writeBytes(Base64.getDecoder().decode(ciSigningEnv["KEYSTORE_BASE64"]))
+                keystoreFile.writeBytes(Base64.getDecoder().decode(ciKeystoreBase64))
                 storeFile = keystoreFile
-                storePassword = ciSigningEnv["KEYSTORE_PASSWORD"]
-                keyAlias = ciSigningEnv["KEY_ALIAS"]
-                keyPassword = ciSigningEnv["KEY_PASSWORD"]
+                storePassword = ciKeystorePassword
+                keyAlias = ciKeyAlias
+                keyPassword = ciKeyPassword
             }
         }
     }
