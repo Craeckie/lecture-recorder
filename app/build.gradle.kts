@@ -1,8 +1,14 @@
+import java.util.Base64
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// Set by CI from repo secrets; absent for every local build, where release stays unsigned
+// exactly as scripts/release.sh (which signs the debug APK separately) expects.
+val ciKeystoreBase64: String? = System.getenv("KEYSTORE_BASE64")
 
 android {
     namespace = "org.Craeckie.lecturerecorder"
@@ -18,11 +24,28 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    if (!ciKeystoreBase64.isNullOrBlank()) {
+        signingConfigs {
+            create("release") {
+                val keystoreFile = layout.buildDirectory.file("ci-release.jks").get().asFile
+                keystoreFile.parentFile.mkdirs()
+                keystoreFile.writeBytes(Base64.getDecoder().decode(ciKeystoreBase64))
+                storeFile = keystoreFile
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            if (!ciKeystoreBase64.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

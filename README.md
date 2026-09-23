@@ -30,13 +30,15 @@ Requires JDK 17 and the Android SDK (`compileSdk`/`targetSdk` 35, `minSdk` 26).
 ./gradlew assembleRelease
 ```
 
-CI (`.github/workflows/build.yml`) runs the same two steps on every push and uploads the
-unsigned release APK as a build artifact.
+CI (`.github/workflows/build.yml`) runs the same two steps on every push. If the repo has
+`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS` and `KEY_PASSWORD` configured as
+secrets, it uploads a signed release APK as the `app-release-signed` build artifact;
+otherwise (e.g. on a fork without those secrets) it falls back to `app-release-unsigned`.
 
 ## Signing a release build
 
-There is no signing key in this repository or its CI — releases are unsigned. To install a
-signed build on your own device, sign it with your own key:
+If you don't have access to the CI-signed `app-release-signed` artifact — e.g. building
+from your own fork — sign a build with your own key instead:
 
 ```sh
 scripts/release.sh <keystore-password>

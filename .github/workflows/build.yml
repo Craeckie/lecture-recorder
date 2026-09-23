@@ -27,10 +27,26 @@ jobs:
         run: ./gradlew testReleaseUnitTest
 
       - name: Build release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew assembleRelease
 
+      # AGP names the output app-release.apk when a signingConfig was applied and
+      # app-release-unsigned.apk otherwise, so this reflects whichever secrets were
+      # actually present at build time -- no secrets.* in an `if:` anywhere.
+      - name: Upload signed APK artifact
+        if: hashFiles('app/build/outputs/apk/release/app-release.apk') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-signed
+          path: app/build/outputs/apk/release/app-release.apk
+
       - name: Upload unsigned APK artifact
+        if: hashFiles('app/build/outputs/apk/release/app-release-unsigned.apk') != ''
         uses: actions/upload-artifact@v4
         with:
           name: app-release-unsigned
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/release/app-release-unsigned.apk
