@@ -7,8 +7,21 @@ plugins {
 }
 
 // Set by CI from repo secrets; absent for every local build, where release stays unsigned
-// exactly as scripts/release.sh (which signs the debug APK separately) expects.
-val ciKeystoreBase64: String? = System.getenv("KEYSTORE_BASE64")
+// exactly as scripts/release.sh (which signs the debug APK separately) expects. Signing is
+// enabled only when ALL FOUR are present -- a partially-configured secret set (e.g. only the
+// keystore itself, not yet the alias/password) must fall back to unsigned, not hand
+// PackageAndroidArtifact an empty alias and fail the whole build.
+val ciSigningEnv = mapOf(
+    "KEYSTORE_BASE64" to System.getenv("KEYSTORE_BASE64"),
+    "KEYSTORE_PASSWORD" to System.getenv("KEYSTORE_PASSWORD"),
+    "KEY_ALIAS" to System.getenv("KEY_ALIAS"),
+    "KEY_PASSWORD" to System.getenv("KEY_PASSWORD"),
+)
+val hasCiSigning = ciSigningEnv.values.all { !it.isNullOrBlank() }
+if (ciSigningEnv.values.any { !it.isNullOrBlank() } && !hasCiSigning) {
+    val missing = ciSigningEnv.filterValues { it.isNullOrBlank() }.keys
+    logger.warn("CI signing secrets partially configured, staying unsigned. Missing: $missing")
+}
 
 android {
     namespace = "org.Craeckie.lecturerecorder"
@@ -24,16 +37,16 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    if (!ciKeystoreBase64.isNullOrBlank()) {
+    if (hasCiSigning) {
         signingConfigs {
             create("release") {
                 val keystoreFile = layout.buildDirectory.file("ci-release.jks").get().asFile
                 keystoreFile.parentFile.mkdirs()
-                keystoreFile.writeBytes(Base64.getDecoder().decode(ciKeystoreBase64))
+                keystoreFile.writeBytes(Base64.getDecoder().decode(ciSigningEnv["KEYSTORE_BASE64"]))
                 storeFile = keystoreFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
+                storePassword = ciSigningEnv["KEYSTORE_PASSWORD"]
+                keyAlias = ciSigningEnv["KEY_ALIAS"]
+                keyPassword = ciSigningEnv["KEY_PASSWORD"]
             }
         }
     }
@@ -43,7 +56,7 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            if (!ciKeystoreBase64.isNullOrBlank()) {
+            if (hasCiSigning) {
                 signingConfig = signingConfigs.getByName("release")
             }
         }
