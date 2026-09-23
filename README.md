@@ -34,8 +34,8 @@ CI (`.github/workflows/build.yml`) runs the same two steps on every push. If the
 `KEYSTORE_BASE64` and `KEYSTORE_PASSWORD` configured as secrets, it uploads a signed
 release APK as the `app-release-signed` build artifact; otherwise (e.g. on a fork without
 those secrets) it falls back to `app-release-unsigned`. The signing key alias defaults to
-`my-key` and the key password defaults to the store password; set `KEY_ALIAS` and/or
-`KEY_PASSWORD` as additional secrets to override either one.
+`my-key` and the key password to the store password (a local Gradle build can override
+either with the `KEY_ALIAS`/`KEY_PASSWORD` environment variables).
 
 ## Signing a release build
 
